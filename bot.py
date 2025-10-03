@@ -3,26 +3,26 @@ import sqlite3
 import json
 import math
 import requests
+import hashlib
+import random
 from typing import List, Dict, Optional, Tuple
 from datetime import timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands
-from openai import OpenAI
-
 LEARNING_CHANNEL = '1411335494234669076'
 TRADING_CHANNEL = '1418976581099065355'
 AUTO_KICK_CHANNEL = '1411335541873709167'
 HELPER_ROLES = ['1418434355650625676', '1352853011424219158', '1372300233240739920']
+STUDENT_ROLE = '1341949236471926805'
 OWNER_ID = '1334138321412296725'
+PORT = int(os.getenv('PORT', 8080))
 
 TOKEN = os.getenv('TOKEN')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-OPENAI_API_KEY = os.getenv('AI')
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 user_messages = {}
+roast_chance = 0.5
 
 class Database:
     def __init__(self, db_path='bloom.db'):
@@ -55,12 +55,12 @@ class Database:
     
     def save_knowledge(self, question: str, answer: str, embedding: List[float]) -> bool:
         try:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 'INSERT OR IGNORE INTO knowledge (question, answer, embedding) VALUES (?, ?, ?)',
                 (question, answer, json.dumps(embedding))
             )
             self.conn.commit()
-            return self.conn.total_changes > 0
+            return cursor.rowcount > 0
         except Exception as e:
             print(f"Error saving knowledge: {e}")
             return False
@@ -105,17 +105,6 @@ class Database:
         return list(reversed([dict(row) for row in cursor.fetchall()]))
 
 db = Database()
-
-def get_embedding(text: str) -> Optional[List[float]]:
-    try:
-        response = openai_client.embeddings.create(
-            model='text-embedding-3-small',
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"Error getting embedding: {e}")
-        return None
 
 def get_openrouter_response(messages: List[Dict], max_tokens: int = 500) -> Optional[str]:
     try:
@@ -169,6 +158,83 @@ def get_ai_response_with_history(user_id: str, question: str) -> Optional[str]:
     if answer:
         db.save_conversation(user_id, question, answer)
     return answer
+
+def get_legendary_roast(context: str) -> Optional[str]:
+    """Generate a legendary roast with a specific prompt."""
+    prompt = f"""Write a savage, comedic roast for a Discord server game feature. This is entertainment where users consent to being roasted.
+
+Context: "{context}"
+
+Requirements:
+- Legendary, rare-event quality (0.5% trigger chance)
+- Brutal, clever, memorable comedy roast
+- Reference the context creatively
+- 1-2 sentences max, under 300 characters
+- End with a deadly emoji (💀, 🪦, ☠️, 🔥)
+
+Examples of the style:
+- "Congrats, you just unlocked Bloom's 0.5% roast… too bad your life stats are still stuck at tutorial level 💀"
+- "Wow, you hit the 0.5% chance… the same odds as someone actually respecting you 🪦"
+- "Lucky pull, unlucky life. Hitting this chance is the closest you'll ever get to winning anything ☠️"
+
+Generate a devastating roast in this style:"""
+    
+    system_prompt = "You are a creative comedy writer specializing in witty roasts and insult comedy for entertainment purposes."
+    return get_ai_response(prompt, system_prompt)
+
+def deterministic_hash(text: str) -> int:
+    """Generate a deterministic hash using SHA256."""
+    return int(hashlib.sha256(text.encode('utf-8')).hexdigest(), 16)
+
+def generate_embedding(text: str) -> Optional[List[float]]:
+    """Generate a discriminative embedding using word-based TF-IDF style vectors."""
+    if not text:
+        return None
+    
+    text_lower = text.lower().strip()
+    import re
+    words = re.findall(r'\b\w+\b', text_lower)
+    
+    if not words:
+        return None
+    
+    embedding = [0.0] * 384
+    
+    word_counts = {}
+    for word in words:
+        word_counts[word] = word_counts.get(word, 0) + 1
+    
+    for word, count in word_counts.items():
+        word_hash = deterministic_hash(word)
+        
+        positions = []
+        for i in range(min(5, len(embedding))):
+            seed = abs(word_hash + i * 12345)
+            positions.append(seed % len(embedding))
+        
+        tf = count / len(words)
+        
+        for pos in positions:
+            embedding[pos] += tf * (1.0 + 0.1 * (word_hash % 100))
+    
+    char_bigrams = set()
+    for i in range(len(text_lower) - 1):
+        if text_lower[i].isalnum() and text_lower[i+1].isalnum():
+            char_bigrams.add(text_lower[i:i+2])
+    
+    for bigram in sorted(char_bigrams):
+        bigram_hash = deterministic_hash(bigram)
+        for i in range(3):
+            pos = abs(bigram_hash + i * 7919) % len(embedding)
+            embedding[pos] += 0.1
+    
+    magnitude = math.sqrt(sum(x * x for x in embedding))
+    if magnitude > 0:
+        embedding = [x / magnitude for x in embedding]
+    else:
+        return None
+    
+    return embedding
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -225,6 +291,17 @@ async def on_message(message):
     if message.author.bot:
         return
     
+    global roast_chance
+    if random.random() < (roast_chance / 100):
+        try:
+            context = f"{message.author.name} said: {message.content}"
+            roast = get_legendary_roast(context)
+            if roast:
+                await message.reply(roast)
+                print(f"🔥 LEGENDARY ROAST TRIGGERED ({roast_chance}% chance) | Target: {message.author.name}")
+        except Exception as e:
+            print(f"Error generating roast: {e}")
+    
     if str(message.channel.id) == TRADING_CHANNEL:
         user_id = str(message.author.id)
         content = message.content.strip().lower()
@@ -257,37 +334,51 @@ async def on_message(message):
         return
     
     if str(message.channel.id) == LEARNING_CHANNEL:
-        if message.reference:
-            member = message.author
-            has_helper_role = any(str(role.id) in HELPER_ROLES for role in member.roles)
-            
-            if has_helper_role:
-                try:
-                    referenced_message = await message.channel.fetch_message(message.reference.message_id)
-                    
-                    if not referenced_message.author.bot:
-                        question = referenced_message.content
-                        answer = message.content
-                        
-                        embedding = get_embedding(question)
-                        
-                        if embedding:
-                            if db.save_knowledge(question, answer, embedding):
-                                print(f"Learned new Q&A: \"{question[:50]}...\"")
-                except Exception as e:
-                    print(f"Error processing helper reply: {e}")
-        else:
-            question_embedding = get_embedding(message.content)
-            
-            if question_embedding:
-                match = db.find_similar_question(question_embedding, 0.65)
+        member = message.author
+        has_helper_role = any(str(role.id) in HELPER_ROLES for role in member.roles)
+        has_student_role = any(str(role.id) == STUDENT_ROLE for role in member.roles)
+        
+        if message.reference and has_helper_role:
+            try:
+                referenced_msg = await message.channel.fetch_message(message.reference.message_id)
                 
-                if match:
-                    try:
-                        await message.reply(match['answer'])
-                        print(f"Replied with stored answer ({match['similarity']*100:.1f}% match)")
-                    except Exception as e:
-                        print(f"Error replying to message: {e}")
+                if referenced_msg and not referenced_msg.author.bot:
+                    student_has_role = any(str(role.id) == STUDENT_ROLE for role in referenced_msg.author.roles)
+                    
+                    if student_has_role:
+                        question = referenced_msg.content.strip()
+                        answer = message.content.strip()
+                        
+                        if question and answer:
+                            embedding = generate_embedding(question)
+                            
+                            if embedding:
+                                saved = db.save_knowledge(question, answer, embedding)
+                                if saved:
+                                    print(f"✅ KV STORED | Question: '{question[:50]}...' | Answer: '{answer[:50]}...' | Helper: {message.author.name}")
+                                else:
+                                    print(f"⚠️ Duplicate question detected, not stored: '{question[:50]}...'")
+            except Exception as e:
+                print(f"Error in learning system: {e}")
+        
+        elif has_student_role and not message.reference:
+            try:
+                question = message.content.strip()
+                
+                if question:
+                    question_embedding = generate_embedding(question)
+                    
+                    if question_embedding:
+                        match = db.find_similar_question(question_embedding, threshold=0.65)
+                        
+                        if match:
+                            similarity_percent = int(match['similarity'] * 100)
+                            await message.reply(
+                                f"{match['answer']}\n\n||[Bloom learned this from helpers so it might not be correct and dont be shy to ping helpers to solve ur answer thank you]|| - {similarity_percent}% confidence"
+                            )
+                            print(f"📚 Answered from knowledge base | Similarity: {similarity_percent}% | Question: '{question[:50]}...'")
+            except Exception as e:
+                print(f"Error in auto-reply system: {e}")
     
     await bot.process_commands(message)
 
@@ -364,5 +455,45 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
     except Exception as e:
         await interaction.followup.send(f"Failed to ban user: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="roastchance", description="Set the legendary roast trigger chance percentage")
+@app_commands.describe(percentage="The percentage chance (0.0 to 100.0) for Bloom to roast")
+async def roastchance(interaction: discord.Interaction, percentage: float):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    if percentage < 0 or percentage > 100:
+        await interaction.response.send_message("Percentage must be between 0.0 and 100.0.", ephemeral=True)
+        return
+    
+    global roast_chance
+    old_chance = roast_chance
+    roast_chance = percentage
+    
+    await interaction.response.send_message(
+        f"🔥 Legendary roast chance updated!\n"
+        f"**Old:** {old_chance}%\n"
+        f"**New:** {roast_chance}%\n\n"
+        f"*Every message now has a {roast_chance}% chance of triggering a devastating roast.*",
+        ephemeral=True
+    )
+    print(f"⚙️ Roast chance updated: {old_chance}% → {roast_chance}% (by {interaction.user.name})")
+
 if __name__ == "__main__":
+    from flask import Flask
+    from threading import Thread
+    
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def home():
+        return "Bloom Bot is running!"
+    
+    def run_flask():
+        app.run(host='0.0.0.0', port=PORT)
+    
+    # Start Flask in a separate thread
+    Thread(target=run_flask).start()
+    
+    # Run the Discord bot
     bot.run(TOKEN)
