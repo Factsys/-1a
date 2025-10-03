@@ -1,374 +1,368 @@
-import discord
-from discord.ext import commands
 import os
 import sqlite3
-import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-import random
+import json
+import math
+import requests
+from typing import List, Dict, Optional, Tuple
+from datetime import timedelta
+import discord
+from discord import app_commands
+from discord.ext import commands
+from openai import OpenAI
+
+LEARNING_CHANNEL = '1411335494234669076'
+TRADING_CHANNEL = '1418976581099065355'
+AUTO_KICK_CHANNEL = '1411335541873709167'
+HELPER_ROLES = ['1418434355650625676', '1352853011424219158', '1372300233240739920']
+OWNER_ID = '1334138321412296725'
 
 TOKEN = os.getenv('TOKEN')
-AI_TOKEN = os.getenv('AI')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+OPENAI_API_KEY = os.getenv('AI')
 
-LEARNING_CHANNEL_ID = 1411335494234669076
-TEACHER_ROLE_ID = 1418434355650625676
-HELPER_ROLE_ID = 1352853011424219158
-JUNIOR_HELPER_ROLE_ID = 1372300233240739920
-STUDENT_ROLE_ID = 1341949236471926805
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-CONFIDENCE_THRESHOLD = 0.65
-EASTER_EGG_CHANCE = 0.005
-OWNER_ID = 1334138321412296725
+user_messages = {}
+
+class Database:
+    def __init__(self, db_path='bloom.db'):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.create_tables()
+    
+    def create_tables(self):
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS knowledge (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT NOT NULL UNIQUE,
+                answer TEXT NOT NULL,
+                embedding TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                response TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.conn.commit()
+    
+    def save_knowledge(self, question: str, answer: str, embedding: List[float]) -> bool:
+        try:
+            self.conn.execute(
+                'INSERT OR IGNORE INTO knowledge (question, answer, embedding) VALUES (?, ?, ?)',
+                (question, answer, json.dumps(embedding))
+            )
+            self.conn.commit()
+            return self.conn.total_changes > 0
+        except Exception as e:
+            print(f"Error saving knowledge: {e}")
+            return False
+    
+    def get_all_knowledge(self) -> List[Dict]:
+        cursor = self.conn.execute('SELECT * FROM knowledge')
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def cosine_similarity(self, a: List[float], b: List[float]) -> float:
+        dot_product = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        return dot_product / (norm_a * norm_b) if norm_a and norm_b else 0
+    
+    def find_similar_question(self, question_embedding: List[float], threshold: float = 0.65) -> Optional[Dict]:
+        knowledge = self.get_all_knowledge()
+        best_match = None
+        best_score = 0
+        
+        for item in knowledge:
+            stored_embedding = json.loads(item['embedding'])
+            similarity = self.cosine_similarity(question_embedding, stored_embedding)
+            
+            if similarity > best_score and similarity >= threshold:
+                best_score = similarity
+                best_match = {**item, 'similarity': similarity}
+        
+        return best_match
+    
+    def save_conversation(self, user_id: str, message: str, response: str):
+        self.conn.execute(
+            'INSERT INTO conversations (user_id, message, response) VALUES (?, ?, ?)',
+            (user_id, message, response)
+        )
+        self.conn.commit()
+    
+    def get_conversation_history(self, user_id: str, limit: int = 5) -> List[Dict]:
+        cursor = self.conn.execute(
+            'SELECT message, response FROM conversations WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+            (user_id, limit)
+        )
+        return list(reversed([dict(row) for row in cursor.fetchall()]))
+
+db = Database()
+
+def get_embedding(text: str) -> Optional[List[float]]:
+    try:
+        response = openai_client.embeddings.create(
+            model='text-embedding-3-small',
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return None
+
+def get_openrouter_response(messages: List[Dict], max_tokens: int = 500) -> Optional[str]:
+    try:
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://replit.com",
+                "X-Title": "Bloom Discord Bot"
+            },
+            json={
+                "model": "x-ai/grok-4-fast:free",
+                "messages": messages,
+                "max_tokens": max_tokens
+            }
+        )
+        
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content']
+        else:
+            print(f"OpenRouter error: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error getting OpenRouter response: {e}")
+        return None
+
+def get_ai_response(prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
+    messages = [
+        {"role": "system", "content": system_prompt or "You are Bloom, a helpful Discord bot assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    return get_openrouter_response(messages)
+
+def get_ai_response_with_history(user_id: str, question: str) -> Optional[str]:
+    history = db.get_conversation_history(user_id, 5)
+    messages = [
+        {
+            "role": "system",
+            "content": "Focus on substance over praise. Skip unnecessary compliments or praise that lacks depth. Engage critically with ideas, questioning assumptions, identifying biases, and offering counterpoints where relevant. Don't shy away from disagreement when it's warranted, and ensure that any agreement is grounded in reason and evidence."
+        }
+    ]
+    
+    for conv in history:
+        messages.append({"role": "user", "content": conv['message']})
+        messages.append({"role": "assistant", "content": conv['response']})
+    
+    messages.append({"role": "user", "content": question})
+    
+    answer = get_openrouter_response(messages)
+    if answer:
+        db.save_conversation(user_id, question, answer)
+    return answer
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.guild_messages = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-genai.configure(api_key=AI_TOKEN)
-model = genai.GenerativeModel('gemini-pro')
-
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-conn = sqlite3.connect('bloom_knowledge.db')
-cursor = conn.cursor()
-
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS knowledge_base (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-        embedding BLOB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(question, answer)
-    )
-''')
-
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value REAL NOT NULL
-    )
-''')
-
-cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('easter_egg_chance', 0.005))
-conn.commit()
-
-def get_easter_egg_chance():
-    cursor.execute('SELECT value FROM settings WHERE key = ?', ('easter_egg_chance',))
-    result = cursor.fetchone()
-    return result[0] if result else 0.005
-
-def set_easter_egg_chance(chance):
-    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('easter_egg_chance', chance))
-    conn.commit()
-
-def get_embedding(text):
-    return embedding_model.encode(text)
-
-def find_similar_question(question_text):
-    question_embedding = get_embedding(question_text)
-
-    cursor.execute('SELECT id, question, answer, embedding FROM knowledge_base')
-    rows = cursor.fetchall()
-
-    if not rows:
-        return None, 0.0
-
-    best_match = None
-    best_similarity = 0.0
-
-    for row in rows:
-        stored_embedding = np.frombuffer(row[3], dtype=np.float32)
-        similarity = cosine_similarity(
-            question_embedding.reshape(1, -1),
-            stored_embedding.reshape(1, -1)
-        )[0][0]
-
-        if similarity > best_similarity:
-            best_similarity = similarity
-            best_match = row
-
-    if best_similarity >= CONFIDENCE_THRESHOLD:
-        return best_match, best_similarity
-
-    return None, best_similarity
-
-def save_qa_pair(question, answer):
-    try:
-        embedding = get_embedding(question)
-        embedding_bytes = embedding.astype(np.float32).tobytes()
-
-        cursor.execute(
-            'INSERT OR IGNORE INTO knowledge_base (question, answer, embedding) VALUES (?, ?, ?)',
-            (question, answer, embedding_bytes)
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-    except Exception as e:
-        print(f"Error saving Q&A pair: {e}")
-        return False
-
-def is_helper(member):
-    if not member:
-        return False
-    role_ids = [role.id for role in member.roles]
-    return any(role_id in role_ids for role_id in [TEACHER_ROLE_ID, HELPER_ROLE_ID, JUNIOR_HELPER_ROLE_ID])
-
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Bloom Learning System is active')
+    print(f'Logged in as {bot.user.name}')
     try:
         synced = await bot.tree.sync()
-        print(f'Synced {len(synced)} slash commands')
+        print(f'Synced {len(synced)} command(s)')
     except Exception as e:
-        print(f'Failed to sync commands: {e}')
+        print(f'Error syncing commands: {e}')
+
+@bot.event
+async def on_member_join(member):
+    from datetime import datetime, timezone
+    
+    account_age = datetime.now(timezone.utc) - member.created_at
+    
+    if account_age.days < 7:
+        try:
+            await member.send(
+                f"Hello {member.name},\n\n"
+                f"Your account is less than 7 days old. For security reasons, "
+                f"you have been automatically kicked from the server.\n\n"
+                f"You are welcome to rejoin once your account is at least 7 days old."
+            )
+        except:
+            pass
+        
+        try:
+            await member.kick(reason="Account < 7 days old")
+            
+            auto_kick_channel = bot.get_channel(int(AUTO_KICK_CHANNEL))
+            if auto_kick_channel:
+                kick_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                await auto_kick_channel.send(
+                    f"**Moderation Action:** kick\n"
+                    f"**Target:** <@{member.id}> (ID: {member.id})\n"
+                    f"**By:** Bloom (auto-kick)\n"
+                    f"**Reason:** Account < 7 days old\n"
+                    f"**Time:** {kick_time}"
+                )
+        except Exception as e:
+            print(f"Error kicking member: {e}")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-
+    
+    if str(message.channel.id) == TRADING_CHANNEL:
+        user_id = str(message.author.id)
+        content = message.content.strip().lower()
+        
+        if user_id not in user_messages:
+            user_messages[user_id] = []
+        
+        if content in user_messages[user_id]:
+            try:
+                await message.delete()
+                await message.author.timeout(timedelta(minutes=10), reason="Repeated trade message in trading channel")
+                
+                temp_msg = await message.channel.send(
+                    f"{message.author.mention} You have been muted for 10 minutes for repeating your trade message. "
+                    f"Please remember:\n"
+                    f"• Do not repeat your trade more than once\n"
+                    f"• Maximum 7 lines per trade\n"
+                    f"• Take conversations to DMs"
+                )
+                await temp_msg.delete(delay=10)
+                print(f"Muted {message.author.name} for repeating message in trading channel")
+            except Exception as e:
+                print(f"Error muting user: {e}")
+        else:
+            user_messages[user_id].append(content)
+            if len(user_messages[user_id]) > 10:
+                user_messages[user_id].pop(0)
+        
+        await bot.process_commands(message)
+        return
+    
+    if str(message.channel.id) == LEARNING_CHANNEL:
+        if message.reference:
+            member = message.author
+            has_helper_role = any(str(role.id) in HELPER_ROLES for role in member.roles)
+            
+            if has_helper_role:
+                try:
+                    referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                    
+                    if not referenced_message.author.bot:
+                        question = referenced_message.content
+                        answer = message.content
+                        
+                        embedding = get_embedding(question)
+                        
+                        if embedding:
+                            if db.save_knowledge(question, answer, embedding):
+                                print(f"Learned new Q&A: \"{question[:50]}...\"")
+                except Exception as e:
+                    print(f"Error processing helper reply: {e}")
+        else:
+            question_embedding = get_embedding(message.content)
+            
+            if question_embedding:
+                match = db.find_similar_question(question_embedding, 0.65)
+                
+                if match:
+                    try:
+                        await message.reply(match['answer'])
+                        print(f"Replied with stored answer ({match['similarity']*100:.1f}% match)")
+                    except Exception as e:
+                        print(f"Error replying to message: {e}")
+    
     await bot.process_commands(message)
 
-    if message.channel.id != LEARNING_CHANNEL_ID:
-        return
-
-    if message.reference and message.reference.resolved:
-        if is_helper(message.author):
-            try:
-                replied_message = message.reference.resolved
-
-                if replied_message.author.bot:
-                    return
-
-                question = replied_message.content.strip()
-                answer = message.content.strip()
-
-                if not question or not answer:
-                    return
-
-                saved = save_qa_pair(question, answer)
-
-                if saved:
-                    await message.add_reaction('✅')
-                    print(f"Learned new Q&A: {question[:50]}... -> {answer[:50]}...")
-            except Exception as e:
-                print(f"Error processing helper reply: {e}")
-
-    else:
-        if not is_helper(message.author):
-            try:
-                question = message.content.strip()
-
-                if not question:
-                    return
-
-                if random.random() < get_easter_egg_chance():
-                    try:
-                        prompt = f"""
-You are Bloom, a Discord bot with a 0.5% chance of speaking.
-When triggered, you must deliver the harshest roast possible.
-
-Context: "{question}"
-
-⚡ Special Rules:
-- This is a rare event, so the roast must feel legendary.
-- Absolutely brutal, clever, and unforgettable.
-- Tie the insult to the context if possible.
-- Keep it 1–2 sentences, max 300 characters.
-- Must make the target regret ever triggering the 0.5% chance.
-- Style: savage Discord roast × boss fight final attack.
-- End with the deadliest emoji you can pick (💀, 🪦, ☠️, 🔥).
-
-🔥 Legendary Roast Examples:
-- "Congrats, you just unlocked Bloom's 0.5% roast… too bad your life stats are still stuck at tutorial level 💀"
-- "Wow, you hit the 0.5% chance… the same odds as someone actually respecting you 🪦"
-- "Lucky pull, unlucky life. Hitting this chance is the closest you'll ever get to winning anything ☠️"
-- "Bloom speaks once in a thousand tries — and still finds you pathetic 🔥"
-
-Now craft the harshest, rare-event roast ever for the given context.
-"""
-                        response = model.generate_content(prompt)
-                        roast = response.text.strip()
-                        await message.reply(roast)
-                        print(f"0.5% roast triggered for: {message.author.name}")
-                        return
-                    except Exception as e:
-                        print(f"Error generating roast: {e}")
-
-                match, similarity = find_similar_question(question)
-
-                if match:
-                    stored_answer = match[2]
-                    await message.reply(stored_answer)
-                    print(f"Replied with stored answer (confidence: {similarity:.2%})")
-                else:
-                    print(f"No confident match found (best: {similarity:.2%}). Staying silent.")
-            except Exception as e:
-                print(f"Error processing student question: {e}")
-
-@bot.tree.command(name='bloom_stats', description='View Bloom knowledge base statistics')
-async def bloom_stats(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    if interaction.channel_id != LEARNING_CHANNEL_ID:
-        await interaction.response.send_message("This command only works in the learning channel.", ephemeral=True)
-        return
-
-    cursor.execute('SELECT COUNT(*) FROM knowledge_base')
-    count = cursor.fetchone()[0]
-
-    embed = discord.Embed(
-        title="🌱 Bloom Knowledge Stats",
-        description=f"I currently know **{count}** Q&A pairs!",
-        color=discord.Color.green()
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name='bloom_search', description='Search for similar questions in knowledge base')
-async def bloom_search(interaction: discord.Interaction, query: str):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    if interaction.channel_id != LEARNING_CHANNEL_ID:
-        await interaction.response.send_message("This command only works in the learning channel.", ephemeral=True)
-        return
-
-    match, similarity = find_similar_question(query)
-
-    if match:
-        embed = discord.Embed(
-            title="🔍 Found Similar Question",
-            description=f"**Confidence:** {similarity:.2%}\n\n**Question:**\n{match[1]}\n\n**Answer:**\n{match[2]}",
-            color=discord.Color.blue()
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
-        await interaction.response.send_message(f"No match found above {CONFIDENCE_THRESHOLD:.0%} threshold. (Best: {similarity:.2%})")
-
-@bot.tree.command(name='tellmeajoke', description='Bloom roasts someone')
-async def tellmeajoke(interaction: discord.Interaction, user: discord.User = None):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    target = user if user else interaction.user
-
-    context = f"Roast this user: {target.name}"
-
-    try:
-        prompt = f"""
-You are Bloom, a savage roasting bot.
-Generate an absolutely brutal roast for this user.
-
-Target: {target.name}
-
-Rules:
-- Harsh, clever, and unforgettable
-- 1-2 sentences max
-- Maximum 300 characters
-- End with a deadly emoji (💀, 🪦, ☠️, 🔥)
-- Make it legendary
-
-Craft the most devastating roast possible.
-"""
-        response = model.generate_content(prompt)
-        roast = response.text.strip()
-
-        await interaction.response.send_message(f"{target.mention} {roast}")
-    except Exception as e:
-        await interaction.response.send_message("Failed to generate roast.", ephemeral=True)
-        print(f"Error in tellmeajoke: {e}")
-
-@bot.tree.command(name='say', description='Make Bloom say something')
+@bot.tree.command(name="say", description="Make the bot say something")
+@app_commands.describe(message="The message to say")
 async def say(interaction: discord.Interaction, message: str):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.send(message)
+    await interaction.followup.send("Message sent!", ephemeral=True)
 
-    await interaction.response.send_message("Processing...", ephemeral=True)
+@bot.tree.command(name="tellmeajoke", description="Get a joke from Bloom")
+@app_commands.describe(
+    context="Optional context for the joke",
+    user="Optional user to mention"
+)
+async def tellmeajoke(interaction: discord.Interaction, context: Optional[str] = None, user: Optional[discord.User] = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    if context:
+        prompt = f"Tell me a unique joke about: {context}. It can be witty, dark, absurd, or edgy. Keep it under 3 sentences. Do not explain the joke."
+    else:
+        prompt = "Tell me a unique joke. It can be witty, dark, absurd, or edgy. Keep it under 3 sentences. Do not explain the joke."
+    
+    system_prompt = "You are a humor bot. When this command is used, respond with a joke. The joke can be witty, dark, absurd, or edgy. Keep it under 3 sentences. Do not explain the joke. Each response should be unique and not a repeat of the last one."
+    
+    joke = get_ai_response(prompt, system_prompt)
+    
+    if joke:
+        final_joke = f"{user.mention} {joke}" if user else joke
+        await interaction.channel.send(final_joke)
+        await interaction.followup.send("Joke sent!", ephemeral=True)
+    else:
+        await interaction.followup.send("Failed to generate joke.", ephemeral=True)
 
-    try:
-        prompt = f"""
-You are Bloom, a Discord bot assistant.
-A user wants you to say something. Respond naturally based on their request.
-
-User's message: "{message}"
-
-Rules:
-- Be helpful and friendly
-- Keep it concise (under 500 characters)
-- If they ask you to say something specific, say it naturally
-- Add personality but stay on topic
-"""
-        response = model.generate_content(prompt)
-        bloom_response = response.text.strip()
-
-        await interaction.channel.send(bloom_response)
-    except Exception as e:
-        await interaction.followup.send("Failed to process message.", ephemeral=True)
-        print(f"Error in say command: {e}")
-
-@bot.tree.command(name='easter', description='Set the easter egg roast chance percentage')
-async def easter(interaction: discord.Interaction, percentage: float):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    if percentage < 0 or percentage > 100:
-        await interaction.response.send_message("Percentage must be between 0 and 100.", ephemeral=True)
-        return
-
-    chance = percentage / 100.0
-    set_easter_egg_chance(chance)
-
-    await interaction.response.send_message(
-        f"Easter egg roast chance set to **{percentage}%** ({chance:.4f})",
-        ephemeral=True
-    )
-    print(f"Easter egg chance updated to {percentage}% by {interaction.user.name}")
-
-@bot.tree.command(name='askbloom', description='Ask Bloom anything with critical thinking')
+@bot.tree.command(name="askbloom", description="Ask Bloom anything")
+@app_commands.describe(question="Your question")
 async def askbloom(interaction: discord.Interaction, question: str):
-    if interaction.user.id != OWNER_ID:
+    await interaction.response.defer()
+    
+    answer = get_ai_response_with_history(str(interaction.user.id), question)
+    
+    if answer:
+        await interaction.followup.send(answer)
+    else:
+        await interaction.followup.send("Sorry, I encountered an error processing your question.")
+
+@bot.tree.command(name="ban", description="Ban a user (Owner only)")
+@app_commands.describe(
+    user="The user to ban",
+    reason="Reason for the ban"
+)
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
+    if str(interaction.user.id) != OWNER_ID:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-
-    await interaction.response.defer()
-
+    
+    await interaction.response.defer(ephemeral=True)
+    
     try:
-        prompt = f"""
-You are Bloom, a critically-thinking AI assistant with a direct, no-nonsense approach.
-
-User's Question: "{question}"
-
-Your Personality:
-- Focus on substance over praise. Skip unnecessary compliments or praise that lacks depth.
-- Engage critically with ideas, questioning assumptions, identifying biases, and offering counterpoints where relevant.
-- Don't shy away from disagreement when it's warranted.
-- Ensure that any agreement is grounded in reason and evidence.
-- Be direct and honest, even if it challenges the user's perspective.
-- Prioritize accuracy and intellectual rigor over being agreeable.
-- Keep responses concise but thorough (under 2000 characters).
-
-Respond to the question with critical analysis, evidence-based reasoning, and intellectual honesty.
-"""
-        response = model.generate_content(prompt)
-        bloom_response = response.text.strip()
-
-        if len(bloom_response) > 2000:
-            bloom_response = bloom_response[:1997] + "..."
-
-        await interaction.followup.send(bloom_response)
+        await user.ban(reason=reason)
+        await interaction.followup.send(f"Successfully banned {user.mention} for: {reason}", ephemeral=True)
+        
+        auto_kick_channel = bot.get_channel(int(AUTO_KICK_CHANNEL))
+        if auto_kick_channel:
+            from datetime import datetime, timezone
+            ban_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            await auto_kick_channel.send(
+                f"**Moderation Action:** ban\n"
+                f"**Target:** <@{user.id}> (ID: {user.id})\n"
+                f"**By:** {interaction.user.mention}\n"
+                f"**Reason:** {reason}\n"
+                f"**Time:** {ban_time}"
+            )
     except Exception as e:
-        await interaction.followup.send("Failed to process your question.")
-        print(f"Error in askbloom: {e}")
+        await interaction.followup.send(f"Failed to ban user: {str(e)}", ephemeral=True)
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
