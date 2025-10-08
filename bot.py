@@ -21,15 +21,18 @@ STUDENT_ROLE = '1341949236471926805'
 OWNER_ID = '1334138321412296725'
 PORT = int(os.getenv('PORT', 5000))
 
-TOKEN = os.getenv('DISCORD_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_KEY')
+TOKEN = os.getenv('TOKEN')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
 user_messages = {}
 user_message_timestamps = {}
 roast_chance = 0.5
 
-KB_REPLY_CONFIDENCE = 0.73
+KB_REPLY_CONFIDENCE = 0.75
 KB_SUGGEST_CONFIDENCE = 0.65
+
+pending_conversations = {}
+conversation_lock = threading.Lock()
 
 KB_REPLY_MODE = "You are Bloom — concise assistant. Rephrase this helper answer in 1 sentence, 6-12 short words. Plain vocabulary only. No emojis, code blocks, or markdown."
 AI_FALLBACK_MODE = "You are Bloom — clear, critical, and educational. Give SHORT answer (1-2 sentences, 15-35 words). Question assumptions. Avoid praise and fluff."
@@ -150,8 +153,154 @@ def calculate_a_substance(answer: str) -> float:
     a_substance = 0.5 * length_score + 0.3 * filler_penalty + 0.2 * detail_score
     return min(a_substance, 1.0)
 
+def is_greeting_or_casual(text: str) -> bool:
+    """Detect if message is a greeting or casual conversation."""
+    import re
+    
+    text_lower = text.lower().strip()
+    words = re.findall(r'\b\w+\b', text_lower)
+    
+    if len(words) <= 3:
+        greetings = {
+            'hi', 'hello', 'hey', 'yo', 'sup', 'what\'s up', 'whats up',
+            'good morning', 'good afternoon', 'good evening', 'good night',
+            'thanks', 'thank you', 'ty', 'thx', 'ok', 'okay', 'sure',
+            'yes', 'no', 'yeah', 'yep', 'nope', 'nah', 'lol', 'lmao',
+            'brb', 'gtg', 'afk', 'dm me', 'check dm', 'check dms'
+        }
+        
+        for greeting in greetings:
+            if greeting in text_lower:
+                return True
+    
+    casual_patterns = [
+        r'^(hi|hello|hey|yo|sup|wassup)\s*$',
+        r'^(thanks|thank you|ty|thx)\s*$',
+        r'^(ok|okay|sure|cool|nice)\s*$',
+        r'^(lol|lmao|haha|hehe)\s*$',
+        r'^(brb|gtg|afk)\s*$',
+        r'^\w{1,3}$'
+    ]
+    
+    for pattern in casual_patterns:
+        if re.match(pattern, text_lower):
+            return True
+    
+    return False
+
+def is_blabberish(text: str) -> bool:
+    """Detect if text is blabberish or nonsensical."""
+    import re
+    
+    text = text.strip()
+    if not text or len(text) < 3:
+        return True
+    
+    words = re.findall(r'\b\w+\b', text.lower())
+    if not words:
+        return True
+    
+    if len(set(words)) == 1 and len(words) > 2:
+        return True
+    
+    consonant_heavy = sum(1 for char in text.lower() if char in 'bcdfghjklmnpqrstvwxyz')
+    vowel_count = sum(1 for char in text.lower() if char in 'aeiou')
+    
+    if vowel_count > 0:
+        consonant_vowel_ratio = consonant_heavy / vowel_count
+        if consonant_vowel_ratio > 5:
+            return True
+    
+    repeated_chars = re.findall(r'(.)\1{4,}', text)
+    if repeated_chars:
+        return True
+    
+    return False
+
+def is_teaching_content(text: str) -> bool:
+    """Determine if text contains teaching/educational content."""
+    import re
+    
+    text_lower = text.lower().strip()
+    words = re.findall(r'\b\w+\b', text_lower)
+    
+    if len(words) < 3:
+        return False
+    
+    instructional_verbs = {
+        'install', 'run', 'use', 'open', 'close', 'start', 'stop', 'restart',
+        'click', 'press', 'type', 'enter', 'select', 'choose', 'delete', 'remove',
+        'add', 'create', 'make', 'build', 'set', 'configure', 'change', 'modify',
+        'update', 'upgrade', 'download', 'upload', 'save', 'load', 'import', 'export',
+        'copy', 'paste', 'cut', 'move', 'drag', 'drop', 'enable', 'disable',
+        'activate', 'deactivate', 'check', 'uncheck', 'navigate', 'go to', 'try'
+    }
+    
+    teaching_indicators = {
+        'because', 'since', 'therefore', 'thus', 'however', 'although',
+        'means', 'refers', 'indicates', 'shows', 'demonstrates',
+        'example', 'such as', 'like', 'including', 'specifically',
+        'first', 'second', 'then', 'next', 'finally', 'steps',
+        'should', 'need to', 'must', 'have to', 'can', 'will', 'would'
+    }
+    
+    has_instructional_verb = any(verb in text_lower for verb in instructional_verbs)
+    if has_instructional_verb:
+        return True
+    
+    has_code_or_command = bool(re.search(r'`[^`]+`|```', text))
+    if has_code_or_command and len(words) >= 3:
+        return True
+    
+    indicator_count = sum(1 for indicator in teaching_indicators if indicator in text_lower)
+    if indicator_count >= 1:
+        return True
+    
+    has_explanation_structure = any([
+        ' is ' in text_lower and len(words) >= 5,
+        ' are ' in text_lower and len(words) >= 5,
+        re.search(r'\d+\s*(steps?|ways?|methods?|points?)', text_lower),
+        re.search(r'(you|we)\s+(can|should|need|must|have to|will|would)', text_lower),
+        re.search(r'(it|this|that)\s+(is|will|would|can|should)', text_lower)
+    ])
+    
+    if has_explanation_structure:
+        return True
+    
+    return False
+
+def aggregate_messages(messages: List[Dict]) -> str:
+    """Aggregate multiple messages into a coherent answer."""
+    if not messages:
+        return ""
+    
+    if len(messages) == 1:
+        return messages[0]['content'].strip()
+    
+    filtered_messages = []
+    for msg in messages:
+        content = msg['content'].strip()
+        if not is_greeting_or_casual(content) and not is_blabberish(content):
+            filtered_messages.append(content)
+    
+    if not filtered_messages:
+        return ""
+    
+    aggregated = ' '.join(filtered_messages)
+    
+    aggregated = ' '.join(aggregated.split())
+    
+    return aggregated
+
 class Database:
-    def __init__(self, db_path='bloom.db'):
+    def __init__(self, db_path=None):
+        if db_path is None:
+            if os.getenv('RENDER'):
+                data_dir = '/opt/render/project/src/data'
+                os.makedirs(data_dir, exist_ok=True)
+                db_path = os.path.join(data_dir, 'bloom.db')
+            else:
+                db_path = 'bloom.db'
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.Lock()
@@ -667,6 +816,72 @@ def generate_embedding(text: str) -> Optional[List[float]]:
     
     return embedding
 
+def process_pending_conversation(thread_id: str, conversation_data: Dict):
+    """Process a pending conversation after aggregation period."""
+    try:
+        question = conversation_data.get('question', '').strip()
+        helper_messages = conversation_data.get('helper_messages', [])
+        
+        if not question or not helper_messages:
+            print(f"⚠️ Skipping incomplete conversation: thread_id={thread_id}")
+            return
+        
+        aggregated_answer = aggregate_messages(helper_messages)
+        
+        if not aggregated_answer:
+            print(f"⚠️ No valid answer after aggregation: thread_id={thread_id}")
+            return
+        
+        if is_greeting_or_casual(aggregated_answer):
+            print(f"⚠️ Aggregated answer is casual/greeting, not storing: '{aggregated_answer[:50]}...'")
+            return
+        
+        if not is_teaching_content(aggregated_answer):
+            print(f"⚠️ Aggregated answer lacks teaching content, not storing: '{aggregated_answer[:50]}...'")
+            return
+        
+        embedding = generate_embedding(question)
+        if not embedding:
+            print(f"⚠️ Failed to generate embedding for: '{question[:50]}...'")
+            return
+        
+        saved = db.save_knowledge(question, aggregated_answer, embedding)
+        if saved:
+            helper_names = ', '.join(set(msg['author'] for msg in helper_messages))
+            print(f"✅ AGGREGATED KB STORED | Q: '{question[:50]}...' | A: '{aggregated_answer[:50]}...' | Helpers: {helper_names}")
+        else:
+            print(f"⚠️ Failed to store aggregated KB: '{question[:50]}...'")
+    
+    except Exception as e:
+        print(f"❌ Error processing conversation {thread_id}: {e}")
+
+async def process_expired_conversations():
+    """Background task to process conversations after 10-minute window."""
+    global pending_conversations
+    
+    while True:
+        try:
+            await asyncio.sleep(30)
+            
+            current_time = datetime.now(timezone.utc)
+            expired_threads = []
+            
+            with conversation_lock:
+                for thread_id, conv_data in list(pending_conversations.items()):
+                    last_message_time = conv_data.get('last_update')
+                    if last_message_time:
+                        time_elapsed = (current_time - last_message_time).total_seconds()
+                        
+                        if time_elapsed >= 600:
+                            expired_threads.append((thread_id, conv_data))
+                            del pending_conversations[thread_id]
+            
+            for thread_id, conv_data in expired_threads:
+                await asyncio.to_thread(process_pending_conversation, thread_id, conv_data)
+        
+        except Exception as e:
+            print(f"❌ Error in background conversation processor: {e}")
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -683,6 +898,9 @@ async def on_ready():
         print(f'Synced {len(synced)} command(s)')
     except Exception as e:
         print(f'Error syncing commands: {e}')
+    
+    bot.loop.create_task(process_expired_conversations())
+    print("🔄 Started background conversation aggregation processor (10-minute window)")
 
 @bot.event
 async def on_member_join(member):
@@ -778,17 +996,34 @@ async def on_message(message):
                     
                     if student_has_role:
                         question = referenced_msg.content.strip()
-                        answer = message.content.strip()
+                        answer_content = message.content.strip()
                         
-                        if question and answer:
-                            embedding = generate_embedding(question)
+                        if question and answer_content:
+                            if is_blabberish(answer_content):
+                                print(f"⚠️ Detected blabberish from {message.author.name}, ignoring: '{answer_content[:30]}...'")
+                                await bot.process_commands(message)
+                                return
                             
-                            if embedding:
-                                saved = db.save_knowledge(question, answer, embedding)
-                                if saved:
-                                    print(f"✅ KV STORED | Question: '{question[:50]}...' | Answer: '{answer[:50]}...' | Helper: {message.author.name}")
-                                else:
-                                    print(f"⚠️ Duplicate question detected, not stored: '{question[:50]}...'")
+                            thread_id = f"{referenced_msg.id}"
+                            
+                            with conversation_lock:
+                                if thread_id not in pending_conversations:
+                                    pending_conversations[thread_id] = {
+                                        'question': question,
+                                        'helper_messages': [],
+                                        'last_update': datetime.now(timezone.utc),
+                                        'student_id': str(referenced_msg.author.id)
+                                    }
+                                
+                                pending_conversations[thread_id]['helper_messages'].append({
+                                    'content': answer_content,
+                                    'author': message.author.name,
+                                    'timestamp': datetime.now(timezone.utc)
+                                })
+                                pending_conversations[thread_id]['last_update'] = datetime.now(timezone.utc)
+                                
+                                msg_count = len(pending_conversations[thread_id]['helper_messages'])
+                                print(f"📝 Helper message tracked ({msg_count} total) | Thread: {thread_id} | Helper: {message.author.name} | Msg: '{answer_content[:40]}...'")
             except Exception as e:
                 print(f"Error in learning system: {e}")
         
@@ -1136,6 +1371,44 @@ async def kbreview(interaction: discord.Interaction):
     
     await interaction.followup.send(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="saywb", description="Send an embedded message with optional title and color")
+@app_commands.describe(
+    description="The message description (required)",
+    title="Optional title for the embed",
+    color="Optional color (gray, red, pink, blue, green, yellow, purple, orange)"
+)
+async def saywb(interaction: discord.Interaction, description: str, title: Optional[str] = None, color: Optional[str] = None):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Map color names to Discord colors
+    color_map = {
+        'gray': discord.Color.light_gray(),
+        'grey': discord.Color.light_gray(),
+        'red': discord.Color.red(),
+        'pink': discord.Color.pink(),
+        'blue': discord.Color.blue(),
+        'green': discord.Color.green(),
+        'yellow': discord.Color.yellow(),
+        'purple': discord.Color.purple(),
+        'orange': discord.Color.orange()
+    }
+    
+    # Get the color, default to black (dark gray)
+    embed_color = color_map.get(color.lower(), discord.Color.from_rgb(0, 0, 0)) if color else discord.Color.from_rgb(0, 0, 0)
+    
+    # Create the embed
+    if title:
+        embed = discord.Embed(title=title, description=description, color=embed_color)
+    else:
+        embed = discord.Embed(description=description, color=embed_color)
+    
+    await interaction.channel.send(embed=embed)
+    await interaction.followup.send("Embed sent!", ephemeral=True)
+
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
     if str(interaction.user.id) != OWNER_ID:
@@ -1161,6 +1434,7 @@ async def help_command(interaction: discord.Interaction):
         name="🎉 Fun Commands",
         value=(
             "**`/say`** - Make the bot say something\n"
+            "**`/saywb`** - Send an embedded message with optional title and color\n"
             "**`/vibe`** - Get a vibe check from Bloom\n"
             "**`/quote`** - Get a motivational quote\n"
             "**`/8ball`** - Ask the magic 8-ball a question\n"
@@ -1208,7 +1482,7 @@ if __name__ == "__main__":
         return {"status": "ok", "bot": "Bloom", "active": True}
     
     @app.get("/kbstats")
-    def kbstats():
+    def get_kb_stats():
         stats = db.get_database_stats()
         return {
             "knowledge_entries": stats.get('knowledge_count', 0),
