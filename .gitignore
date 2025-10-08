@@ -1,0 +1,7 @@
+bloom.db
+__pycache__/
+*.pyc
+.pythonlibs/
+uv.lock
+pyproject.toml
+.env
