@@ -27,12 +27,14 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
 user_messages = {}
 user_message_timestamps = {}
+user_last_message_content = {}
 roast_chance = 0.5
 
 KB_REPLY_CONFIDENCE = 0.85
 KB_SUGGEST_CONFIDENCE = 0.75
 
 pending_conversations = {}
+user_question_tracking = {}
 conversation_lock = threading.Lock()
 
 KB_REPLY_MODE = "You are Bloom — concise assistant. Rephrase this helper answer in 1 sentence, 6-12 short words. Plain vocabulary only. No emojis, code blocks, or markdown."
@@ -106,8 +108,60 @@ def detect_pii(text: str) -> bool:
 
     return False
 
+def is_actually_a_question(text: str) -> bool:
+    """Check if text is actually a question and not instructions or statements."""
+    import re
+    
+    text_lower = text.lower().strip()
+    words = re.findall(r'\b\w+\b', text_lower)
+    
+    instruction_starts = [
+        r'^\d+\.',
+        r'^(first|second|third|then|next|finally|step)',
+    ]
+    
+    for pattern in instruction_starts:
+        if re.match(pattern, text_lower):
+            return False
+    
+    numbered_steps = re.findall(r'\d+\.', text)
+    if len(numbered_steps) >= 2:
+        return False
+    
+    question_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'would', 'should', 'could', 'any', 'need'}
+    has_question_word = any(word in words for word in question_words)
+    
+    has_question_mark = '?' in text
+    
+    if has_question_mark or has_question_word:
+        return True
+    
+    if len(words) < 2:
+        return False
+    
+    return False
+
+def answer_relevance_score(question: str, answer: str) -> float:
+    """Calculate how relevant an answer is to its question based on word overlap."""
+    import re
+    
+    question_words = set(re.findall(r'\b\w{3,}\b', question.lower()))
+    answer_words = set(re.findall(r'\b\w{3,}\b', answer.lower()))
+    
+    stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'this', 'that', 'with', 'from'}
+    question_words = question_words - stop_words
+    answer_words = answer_words - stop_words
+    
+    if not question_words:
+        return 0.0
+    
+    overlap = question_words.intersection(answer_words)
+    relevance = len(overlap) / len(question_words)
+    
+    return relevance
+
 def calculate_q_clear(question: str) -> float:
-    """Calculate question clarity score based on length, structure, and question words."""
+    """Calculate question clarity score - more lenient for short but clear questions."""
     import re
 
     question = question.strip()
@@ -117,21 +171,28 @@ def calculate_q_clear(question: str) -> float:
     words = re.findall(r'\b\w+\b', question.lower())
     if not words:
         return 0.0
+    
+    if not is_actually_a_question(question):
+        return 0.0
 
-    length_score = min(len(words) / 15.0, 1.0)
+    length_score = min(len(words) / 10.0, 1.0)
 
-    question_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which', 'can', 'is', 'are', 'do', 'does'}
+    question_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'should'}
     has_question_word = any(word in words for word in question_words)
-    question_word_score = 1.0 if has_question_word else 0.5
+    question_word_score = 1.0 if has_question_word else 0.6
 
-    has_punctuation = '?' in question or '.' in question
-    punctuation_score = 1.0 if has_punctuation else 0.8
+    has_punctuation = '?' in question
+    punctuation_score = 1.0 if has_punctuation else 0.7
 
-    q_clear = 0.5 * length_score + 0.3 * question_word_score + 0.2 * punctuation_score
+    q_clear = 0.4 * length_score + 0.4 * question_word_score + 0.2 * punctuation_score
+    
+    if len(words) >= 3 and (has_question_word or has_punctuation):
+        q_clear = max(q_clear, 0.6)
+    
     return min(q_clear, 1.0)
 
 def calculate_a_substance(answer: str) -> float:
-    """Calculate answer substance score based on length, detail, and informativeness."""
+    """Calculate answer substance score - more lenient for concise instructional answers."""
     import re
 
     answer = answer.strip()
@@ -142,17 +203,21 @@ def calculate_a_substance(answer: str) -> float:
     if not words:
         return 0.0
 
-    length_score = min(len(words) / 25.0, 1.0)
+    length_score = min(len(words) / 15.0, 1.0)
 
     filler_words = {'um', 'uh', 'like', 'just', 'really', 'very', 'actually', 'basically'}
     filler_count = sum(1 for word in words if word in filler_words)
     filler_penalty = max(0, 1.0 - (filler_count / len(words)) * 2)
 
-    has_details = len(words) > 10 and (bool(re.search(r'\d', answer)) or any(w in words for w in ['because', 'since', 'therefore', 'thus', 'due']))
-    detail_score = 1.0 if has_details else 0.6
+    instructional_verbs = {'press', 'click', 'use', 'try', 'check', 'make', 'set', 'turn', 'cook', 'spam', 'enable', 'disable'}
+    has_instructional = any(verb in words for verb in instructional_verbs)
+    
+    has_details = len(words) > 8 and (bool(re.search(r'\d', answer)) or any(w in words for w in ['because', 'since', 'therefore', 'thus', 'due']))
+    
+    detail_score = 1.0 if (has_details or has_instructional) else 0.6
 
-    a_substance = 0.5 * length_score + 0.3 * filler_penalty + 0.2 * detail_score
-    return min(a_substance, 1.0)
+    a_substance = 0.4 * length_score + 0.3 * filler_penalty + 0.3 * detail_score
+    return min(max(a_substance, 0.6 if len(words) >= 2 and has_instructional else a_substance), 1.0)
 
 def is_greeting_or_casual(text: str) -> bool:
     """Detect if message is a greeting or casual conversation."""
@@ -219,56 +284,36 @@ def is_blabberish(text: str) -> bool:
     return False
 
 def is_teaching_content(text: str) -> bool:
-    """Determine if text contains teaching/educational content."""
+    """Check if text is NOT casual chat - allows any non-casual response as teaching content."""
     import re
 
     text_lower = text.lower().strip()
     words = re.findall(r'\b\w+\b', text_lower)
 
-    if len(words) < 3:
+    if len(words) < 2:
         return False
 
-    instructional_verbs = {
-        'install', 'run', 'use', 'open', 'close', 'start', 'stop', 'restart',
-        'click', 'press', 'type', 'enter', 'select', 'choose', 'delete', 'remove',
-        'add', 'create', 'make', 'build', 'set', 'configure', 'change', 'modify',
-        'update', 'upgrade', 'download', 'upload', 'save', 'load', 'import', 'export',
-        'copy', 'paste', 'cut', 'move', 'drag', 'drop', 'enable', 'disable',
-        'activate', 'deactivate', 'check', 'uncheck', 'navigate', 'go to', 'try'
+    casual_response_patterns = [
+        r'^i (already|just|dont|didnt|hate|love|always) (do|did)',
+        r'^(yeah|yep|nah|nope|idk|same|lol|lmao|bruh|fr|ngl|tbh)\b',
+        r'^(thanks|thank you|ty|thx|ok|okay|cool|nice)\s*$',
+    ]
+    
+    for pattern in casual_response_patterns:
+        if re.search(pattern, text_lower):
+            return False
+
+    negative_phrases = {
+        'i already do this', 'i already do that', 'i hate', 'i dont know',
+        'idk', 'no idea', 'not sure', 'maybe', 'i think', 'probably',
+        'same here', 'me too', 'same problem', 'same issue'
     }
+    
+    for phrase in negative_phrases:
+        if phrase in text_lower and len(words) < 15:
+            return False
 
-    teaching_indicators = {
-        'because', 'since', 'therefore', 'thus', 'however', 'although',
-        'means', 'refers', 'indicates', 'shows', 'demonstrates',
-        'example', 'such as', 'like', 'including', 'specifically',
-        'first', 'second', 'then', 'next', 'finally', 'steps',
-        'should', 'need to', 'must', 'have to', 'can', 'will', 'would'
-    }
-
-    has_instructional_verb = any(verb in text_lower for verb in instructional_verbs)
-    if has_instructional_verb:
-        return True
-
-    has_code_or_command = bool(re.search(r'`[^`]+`|```', text))
-    if has_code_or_command and len(words) >= 3:
-        return True
-
-    indicator_count = sum(1 for indicator in teaching_indicators if indicator in text_lower)
-    if indicator_count >= 1:
-        return True
-
-    has_explanation_structure = any([
-        ' is ' in text_lower and len(words) >= 5,
-        ' are ' in text_lower and len(words) >= 5,
-        re.search(r'\d+\s*(steps?|ways?|methods?|points?)', text_lower),
-        re.search(r'(you|we)\s+(can|should|need|must|have to|will|would)', text_lower),
-        re.search(r'(it|this|that)\s+(is|will|would|can|should)', text_lower)
-    ])
-
-    if has_explanation_structure:
-        return True
-
-    return False
+    return True
 
 def aggregate_messages(messages: List[Dict]) -> str:
     """Aggregate multiple messages into a coherent answer."""
@@ -404,11 +449,11 @@ class Database:
             q_clear = calculate_q_clear(question)
             a_substance = calculate_a_substance(answer)
 
-            if q_clear < 0.6:
+            if q_clear < 0.4:
                 print(f"⚠️ Low question clarity ({q_clear:.2f}), not storing: '{question[:30]}...'")
                 return False
 
-            if a_substance < 0.6:
+            if a_substance < 0.4:
                 print(f"⚠️ Low answer substance ({a_substance:.2f}), not storing: '{question[:30]}...'")
                 return False
 
@@ -944,44 +989,66 @@ def generate_embedding(text: str) -> Optional[List[float]]:
 
     return embedding
 
-def process_pending_conversation(thread_id: str, conversation_data: Dict):
-    """Process a pending conversation after aggregation period."""
+def process_pending_conversation(user_id: str, conversation_data: Dict):
+    """Process a pending conversation after aggregation period - supports multiple Q&A pairs."""
     try:
-        question = conversation_data.get('question', '').strip()
-        helper_messages = conversation_data.get('helper_messages', [])
+        questions = conversation_data.get('questions', [])
+        all_answers = conversation_data.get('answers', [])
 
-        if not question or not helper_messages:
-            print(f"⚠️ Skipping incomplete conversation: thread_id={thread_id}")
+        if not questions:
+            print(f"⚠️ Skipping conversation for user {user_id}: No questions")
             return
 
-        aggregated_answer = aggregate_messages(helper_messages)
+        stored_count = 0
 
-        if not aggregated_answer:
-            print(f"⚠️ No valid answer after aggregation: thread_id={thread_id}")
-            return
+        for question_data in questions:
+            question_text = question_data.get('text', '').strip()
+            question_id = question_data.get('id')
 
-        if is_greeting_or_casual(aggregated_answer):
-            print(f"⚠️ Aggregated answer is casual/greeting, not storing: '{aggregated_answer[:50]}...'")
-            return
+            if not question_text:
+                continue
 
-        if not is_teaching_content(aggregated_answer):
-            print(f"⚠️ Aggregated answer lacks teaching content, not storing: '{aggregated_answer[:50]}...'")
-            return
+            if is_greeting_or_casual(question_text) or is_blabberish(question_text):
+                print(f"⚠️ Skipping question '{question_text[:30]}...': greeting/casual/blabberish")
+                continue
+            
+            if not is_actually_a_question(question_text):
+                print(f"⚠️ Skipping '{question_text[:30]}...': Not a question (likely instructions/steps)")
+                continue
 
-        embedding = generate_embedding(question)
-        if not embedding:
-            print(f"⚠️ Failed to generate embedding for: '{question[:50]}...'")
-            return
+            related_answers = [
+                ans for ans in all_answers
+                if ans.get('reply_to') == question_id and is_teaching_content(ans['text'])
+            ]
 
-        saved = db.save_knowledge(question, aggregated_answer, embedding)
-        if saved:
-            helper_names = ', '.join(set(msg['author'] for msg in helper_messages))
-            print(f"✅ AGGREGATED KB STORED | Q: '{question[:50]}...' | A: '{aggregated_answer[:50]}...' | Helpers: {helper_names}")
-        else:
-            print(f"⚠️ Failed to store aggregated KB: '{question[:50]}...'")
+            if not related_answers:
+                print(f"⚠️ Skipping question '{question_text[:30]}...': No teaching answers")
+                continue
+
+            aggregated_answer = aggregate_messages([{'content': ans['text']} for ans in related_answers])
+
+            if not aggregated_answer or len(aggregated_answer) < 5:
+                print(f"⚠️ Skipping question '{question_text[:30]}...': Answer too short")
+                continue
+
+            embedding = generate_embedding(question_text)
+            if not embedding:
+                print(f"⚠️ Failed to generate embedding for: '{question_text[:50]}...'")
+                continue
+
+            saved = db.save_knowledge(question_text, aggregated_answer, embedding)
+            if saved:
+                helper_names = ', '.join(set(ans['author'] for ans in related_answers))
+                print(f"✅ KB STORED | Q: '{question_text[:50]}...' | A: '{aggregated_answer[:50]}...' | Helpers: {helper_names}")
+                stored_count += 1
+            else:
+                print(f"⚠️ Failed to store KB: '{question_text[:50]}...'")
+
+        if stored_count > 0:
+            print(f"📦 Conversation complete for user {user_id}: {stored_count} Q&A pairs stored")
 
     except Exception as e:
-        print(f"❌ Error processing conversation {thread_id}: {e}")
+        print(f"❌ Error processing conversation for user {user_id}: {e}")
 
 async def process_expired_conversations():
     """Background task to process conversations after 10-minute window."""
@@ -992,20 +1059,20 @@ async def process_expired_conversations():
             await asyncio.sleep(30)
 
             current_time = datetime.now(timezone.utc)
-            expired_threads = []
+            expired_users = []
 
             with conversation_lock:
-                for thread_id, conv_data in list(pending_conversations.items()):
+                for user_id, conv_data in list(pending_conversations.items()):
                     last_message_time = conv_data.get('last_update')
                     if last_message_time:
                         time_elapsed = (current_time - last_message_time).total_seconds()
 
                         if time_elapsed >= 600:
-                            expired_threads.append((thread_id, conv_data))
-                            del pending_conversations[thread_id]
+                            expired_users.append((user_id, conv_data))
+                            del pending_conversations[user_id]
 
-            for thread_id, conv_data in expired_threads:
-                await asyncio.to_thread(process_pending_conversation, thread_id, conv_data)
+            for user_id, conv_data in expired_users:
+                await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
 
         except Exception as e:
             print(f"❌ Error in background conversation processor: {e}")
@@ -1157,32 +1224,37 @@ async def on_message(message):
     if str(message.channel.id) == TRADING_CHANNEL:
         user_id = str(message.author.id)
         content = message.content.strip().lower()
+        current_time = datetime.now(timezone.utc)
 
-        if user_id not in user_messages:
-            user_messages[user_id] = []
+        if user_id in user_last_message_content:
+            last_content = user_last_message_content[user_id]['content']
+            last_time = user_last_message_content[user_id]['time']
+            time_diff = (current_time - last_time).total_seconds()
 
-        user_message_timestamps[user_id] = datetime.now(timezone.utc)
+            if content == last_content and time_diff < 10:
+                try:
+                    await message.delete()
+                    await message.author.timeout(timedelta(minutes=10), reason="Repeated trade message within 10 seconds")
 
-        if content in user_messages[user_id]:
-            try:
-                await message.delete()
-                await message.author.timeout(timedelta(minutes=10), reason="Repeated trade message in trading channel")
+                    temp_msg = await message.channel.send(
+                        f"{message.author.mention} You have been muted for 10 minutes for spamming the same message. "
+                        f"Please remember:\n"
+                        f"• Do not spam the same message\n"
+                        f"• Wait at least 10 seconds before reposting\n"
+                        f"• Take conversations to DMs"
+                    )
+                    await temp_msg.delete(delay=10)
+                    print(f"Muted {message.author.name} for spamming in trading channel (repeated within {time_diff:.1f}s)")
+                except Exception as e:
+                    print(f"Error muting user: {e}")
+                
+                await bot.process_commands(message)
+                return
 
-                temp_msg = await message.channel.send(
-                    f"{message.author.mention} You have been muted for 10 minutes for repeating your trade message. "
-                    f"Please remember:\n"
-                    f"• Do not repeat your trade more than once\n"
-                    f"• Maximum 7 lines per trade\n"
-                    f"• Take conversations to DMs"
-                )
-                await temp_msg.delete(delay=10)
-                print(f"Muted {message.author.name} for repeating message in trading channel")
-            except Exception as e:
-                print(f"Error muting user: {e}")
-        else:
-            user_messages[user_id].append(content)
-            if len(user_messages[user_id]) > 10:
-                user_messages[user_id].pop(0)
+        user_last_message_content[user_id] = {
+            'content': content,
+            'time': current_time
+        }
 
         await bot.process_commands(message)
         return
@@ -1200,35 +1272,34 @@ async def on_message(message):
                     student_has_role = any(str(role.id) == STUDENT_ROLE for role in referenced_msg.author.roles)
 
                     if student_has_role:
-                        question = referenced_msg.content.strip()
                         answer_content = message.content.strip()
 
-                        if question and answer_content:
+                        if answer_content:
                             if is_blabberish(answer_content):
                                 print(f"⚠️ Detected blabberish from {message.author.name}, ignoring: '{answer_content[:30]}...'")
                                 await bot.process_commands(message)
                                 return
 
-                            thread_id = f"{referenced_msg.id}"
+                            student_user_id = str(referenced_msg.author.id)
 
                             with conversation_lock:
-                                if thread_id not in pending_conversations:
-                                    pending_conversations[thread_id] = {
-                                        'question': question,
-                                        'helper_messages': [],
-                                        'last_update': datetime.now(timezone.utc),
-                                        'student_id': str(referenced_msg.author.id)
+                                if student_user_id not in pending_conversations:
+                                    pending_conversations[student_user_id] = {
+                                        'questions': [],
+                                        'answers': [],
+                                        'last_update': datetime.now(timezone.utc)
                                     }
 
-                                pending_conversations[thread_id]['helper_messages'].append({
-                                    'content': answer_content,
+                                pending_conversations[student_user_id]['answers'].append({
+                                    'text': answer_content,
                                     'author': message.author.name,
+                                    'reply_to': str(referenced_msg.id),
                                     'timestamp': datetime.now(timezone.utc)
                                 })
-                                pending_conversations[thread_id]['last_update'] = datetime.now(timezone.utc)
+                                pending_conversations[student_user_id]['last_update'] = datetime.now(timezone.utc)
 
-                                msg_count = len(pending_conversations[thread_id]['helper_messages'])
-                                print(f"📝 Helper message tracked ({msg_count} total) | Thread: {thread_id} | Helper: {message.author.name} | Msg: '{answer_content[:40]}...'")
+                                ans_count = len(pending_conversations[student_user_id]['answers'])
+                                print(f"📝 Answer tracked ({ans_count} total) | Student: {referenced_msg.author.name} | Helper: {message.author.name} | Msg: '{answer_content[:40]}...'")
             except Exception as e:
                 print(f"Error in learning system: {e}")
 
@@ -1237,6 +1308,26 @@ async def on_message(message):
                 question = message.content.strip()
 
                 if question:
+                    student_user_id = str(message.author.id)
+
+                    with conversation_lock:
+                        if student_user_id not in pending_conversations:
+                            pending_conversations[student_user_id] = {
+                                'questions': [],
+                                'answers': [],
+                                'last_update': datetime.now(timezone.utc)
+                            }
+
+                        pending_conversations[student_user_id]['questions'].append({
+                            'text': question,
+                            'id': str(message.id),
+                            'timestamp': datetime.now(timezone.utc)
+                        })
+                        pending_conversations[student_user_id]['last_update'] = datetime.now(timezone.utc)
+
+                        q_count = len(pending_conversations[student_user_id]['questions'])
+                        print(f"❓ Question tracked ({q_count} total) | Student: {message.author.name} | Q: '{question[:40]}...'")
+
                     question_embedding = generate_embedding(question)
 
                     if question_embedding:
@@ -1597,6 +1688,114 @@ async def kbreview(interaction: discord.Interaction):
         embed.set_footer(text=f"Showing 5 of {len(entries)} entries. Use /kbpurge to remove low-quality entries.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="deletekb", description="Delete ALL knowledge base entries (WARNING: Cannot be undone!)")
+async def deletekb(interaction: discord.Interaction):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        stats = db.get_database_stats()
+        entry_count = stats.get('knowledge_count', 0)
+
+        if entry_count == 0:
+            await interaction.followup.send("ℹ️ Knowledge base is already empty.", ephemeral=True)
+            return
+
+        conn = db.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM knowledge')
+                conn.commit()
+            
+            await interaction.followup.send(
+                f"🗑️ **Knowledge base cleared!**\n\n"
+                f"Deleted {entry_count} entries from the knowledge base.\n"
+                f"This action cannot be undone.",
+                ephemeral=True
+            )
+            print(f"🗑️ FULL KB PURGE: {entry_count} entries deleted by {interaction.user.name}")
+        finally:
+            db.put_connection(conn)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error clearing knowledge base: {str(e)}", ephemeral=True)
+        print(f"Error in /deletekb: {e}")
+
+@bot.tree.command(name="store", description="Bulk import knowledge base entries from JSON")
+@app_commands.describe(json_data="JSON array of KB entries with question, answer, q_clear, a_substance fields")
+async def store(interaction: discord.Interaction, json_data: str):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        entries = json.loads(json_data)
+        
+        if not isinstance(entries, list):
+            await interaction.followup.send("❌ JSON data must be an array of entries.", ephemeral=True)
+            return
+
+        imported_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for entry in entries:
+            try:
+                question = entry.get('question', '').strip()
+                answer = entry.get('answer', '').strip()
+                
+                if not question or not answer:
+                    skipped_count += 1
+                    continue
+
+                q_clear = entry.get('q_clear', calculate_q_clear(question))
+                a_substance = entry.get('a_substance', calculate_a_substance(answer))
+
+                embedding = generate_embedding(question)
+                if not embedding:
+                    error_count += 1
+                    continue
+
+                conn = db.get_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            'INSERT INTO knowledge (question, answer, embedding, q_clear, a_substance, approved) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (question) DO NOTHING',
+                            (question, answer, json.dumps(embedding), q_clear, a_substance, entry.get('approved', 1))
+                        )
+                        conn.commit()
+                        if cur.rowcount > 0:
+                            imported_count += 1
+                        else:
+                            skipped_count += 1
+                finally:
+                    db.put_connection(conn)
+
+            except Exception as e:
+                error_count += 1
+                print(f"Error importing entry: {e}")
+
+        await interaction.followup.send(
+            f"📦 **Bulk import complete!**\n\n"
+            f"✅ Imported: {imported_count}\n"
+            f"⏭️ Skipped: {skipped_count}\n"
+            f"❌ Errors: {error_count}\n\n"
+            f"Total processed: {len(entries)}",
+            ephemeral=True
+        )
+        print(f"📦 Bulk import by {interaction.user.name}: {imported_count} imported, {skipped_count} skipped, {error_count} errors")
+
+    except json.JSONDecodeError as e:
+        await interaction.followup.send(f"❌ Invalid JSON format: {str(e)}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error during import: {str(e)}", ephemeral=True)
+        print(f"Error in /store: {e}")
 
 @bot.tree.command(name="saywb", description="Send an embedded message with optional title and color")
 @app_commands.describe(
