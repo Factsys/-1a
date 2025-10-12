@@ -32,12 +32,15 @@ user_message_timestamps = {}
 user_last_message_content = {}
 roast_chance = 0.1
 
-KB_REPLY_CONFIDENCE = 0.85
-KB_SUGGEST_CONFIDENCE = 0.75
+KB_REPLY_CONFIDENCE = 0.75
+KB_SUGGEST_CONFIDENCE = 0.65
+KB_SIMILARITY_THRESHOLD = 0.70
 
 pending_conversations = {}
 user_question_tracking = {}
 conversation_lock = threading.Lock()
+conversation_end_check_cache = {}
+last_end_check_time = {}
 
 KB_REPLY_MODE = "You are Bloom — concise assistant. Rephrase this helper answer in 1 sentence, 6-12 short words. Plain vocabulary only. No emojis, code blocks, or markdown."
 AI_FALLBACK_MODE = "You are Bloom — clear, critical, and educational. Give SHORT answer (1-2 sentences, 15-35 words). Question assumptions. Avoid praise and fluff."
@@ -96,16 +99,21 @@ def detect_pii(text: str) -> bool:
     """Detect PII (emails, phone numbers, addresses) in text."""
     import re
 
+    # Remove Discord mentions before checking for PII
+    text_cleaned = re.sub(r'<@!?\d+>', '', text)
+    text_cleaned = re.sub(r'<#\d+>', '', text_cleaned)
+    text_cleaned = re.sub(r'<@&\d+>', '', text_cleaned)
+
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    if re.search(email_pattern, text):
+    if re.search(email_pattern, text_cleaned):
         return True
 
     phone_pattern = r'(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
-    if re.search(phone_pattern, text):
+    if re.search(phone_pattern, text_cleaned):
         return True
 
     address_pattern = r'\d+\s+[\w\s]+\s+(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|circle|cir|way)'
-    if re.search(address_pattern, text, re.IGNORECASE):
+    if re.search(address_pattern, text_cleaned, re.IGNORECASE):
         return True
 
     return False
@@ -163,7 +171,7 @@ def answer_relevance_score(question: str, answer: str) -> float:
     return relevance
 
 def calculate_q_clear(question: str) -> float:
-    """Calculate question clarity score - more lenient for short but clear questions."""
+    """Calculate question clarity score - strict for quality control."""
     import re
 
     question = question.strip()
@@ -181,20 +189,21 @@ def calculate_q_clear(question: str) -> float:
 
     question_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'should'}
     has_question_word = any(word in words for word in question_words)
-    question_word_score = 1.0 if has_question_word else 0.6
+    question_word_score = 1.0 if has_question_word else 0.5
 
     has_punctuation = '?' in question
-    punctuation_score = 1.0 if has_punctuation else 0.7
+    punctuation_score = 1.0 if has_punctuation else 0.6
 
     q_clear = 0.4 * length_score + 0.4 * question_word_score + 0.2 * punctuation_score
     
-    if len(words) >= 3 and (has_question_word or has_punctuation):
-        q_clear = max(q_clear, 0.6)
+    # Require minimum 5 words for good clarity
+    if len(words) < 5:
+        q_clear *= 0.8
     
     return min(q_clear, 1.0)
 
 def calculate_a_substance(answer: str) -> float:
-    """Calculate answer substance score - more lenient for concise instructional answers."""
+    """Calculate answer substance score - strict to reject non-answers."""
     import re
 
     answer = answer.strip()
@@ -205,21 +214,41 @@ def calculate_a_substance(answer: str) -> float:
     if not words:
         return 0.0
 
+    # Reject if answer is actually a question
+    question_words = {'what', 'why', 'how', 'when', 'where', 'who', 'which', 'do', 'does', 'can', 'should', 'would', 'could'}
+    question_count = sum(1 for word in words if word in question_words)
+    if question_count >= 2 or (question_count == 1 and '?' in answer):
+        return 0.0  # This is a question, not an answer
+    
+    # Reject vague affirmations
+    vague_patterns = [
+        r'^(yes|no|yeah|nah|yep|nope)\s+(there\s+is|it\s+is|i\s+think)',
+        r'^(idk|dunno|not\s+sure|maybe)',
+        r'^(in\s+this\s+server|not\s+in\s+this)'
+    ]
+    for pattern in vague_patterns:
+        if re.match(pattern, answer.lower()):
+            return 0.0
+
     length_score = min(len(words) / 15.0, 1.0)
+    
+    # Penalize very short answers heavily
+    if len(words) < 5:
+        length_score *= 0.5
 
     filler_words = {'um', 'uh', 'like', 'just', 'really', 'very', 'actually', 'basically'}
     filler_count = sum(1 for word in words if word in filler_words)
     filler_penalty = max(0, 1.0 - (filler_count / len(words)) * 2)
 
-    instructional_verbs = {'press', 'click', 'use', 'try', 'check', 'make', 'set', 'turn', 'cook', 'spam', 'enable', 'disable'}
+    instructional_verbs = {'press', 'click', 'use', 'try', 'check', 'make', 'set', 'turn', 'cook', 'spam', 'enable', 'disable', 'get', 'need', 'go', 'open'}
     has_instructional = any(verb in words for verb in instructional_verbs)
     
-    has_details = len(words) > 8 and (bool(re.search(r'\d', answer)) or any(w in words for w in ['because', 'since', 'therefore', 'thus', 'due']))
+    has_details = len(words) > 8 and (bool(re.search(r'\d', answer)) or any(w in words for w in ['because', 'since', 'therefore', 'thus', 'due', 'when', 'after', 'before']))
     
-    detail_score = 1.0 if (has_details or has_instructional) else 0.6
+    detail_score = 1.0 if has_details else (0.7 if has_instructional and len(words) >= 8 else 0.4)
 
     a_substance = 0.4 * length_score + 0.3 * filler_penalty + 0.3 * detail_score
-    return min(max(a_substance, 0.6 if len(words) >= 2 and has_instructional else a_substance), 1.0)
+    return min(a_substance, 1.0)
 
 def is_greeting_or_casual(text: str) -> bool:
     """Detect if message is a greeting or casual conversation."""
@@ -368,10 +397,21 @@ class Database:
         self.create_tables()
 
     def get_connection(self):
-        return self.connection_pool.getconn()
+        try:
+            return self.connection_pool.getconn()
+        except psycopg2.pool.PoolError as e:
+            print(f"❌ Connection pool error: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error getting connection: {e}")
+            raise
 
     def put_connection(self, conn):
-        self.connection_pool.putconn(conn)
+        try:
+            if conn:
+                self.connection_pool.putconn(conn)
+        except Exception as e:
+            print(f"⚠️ Error returning connection to pool: {e}")
 
     def create_tables(self):
         conn = self.get_connection()
@@ -503,12 +543,12 @@ class Database:
             q_clear = calculate_q_clear(question)
             a_substance = calculate_a_substance(answer)
 
-            if q_clear < 0.4:
-                print(f"⚠️ Low question clarity ({q_clear:.2f}), not storing: '{question[:30]}...'")
+            if q_clear < 0.65:
+                print(f"⚠️ Low question clarity ({q_clear:.2f}), not storing: '{question[:50]}...'")
                 return False
 
-            if a_substance < 0.4:
-                print(f"⚠️ Low answer substance ({a_substance:.2f}), not storing: '{question[:30]}...'")
+            if a_substance < 0.65:
+                print(f"⚠️ Low answer substance ({a_substance:.2f}), not storing | Q: '{question[:50]}...' | A: '{answer[:50]}...'")
                 return False
 
             duplicate = self.enhanced_duplicate_check(question, answer, embedding)
@@ -591,16 +631,22 @@ class Database:
         return matches[:top_n]
 
     def save_conversation(self, user_id: str, message: str, response: str):
-        conn = self.get_connection()
+        conn = None
         try:
+            conn = self.get_connection()
             with conn.cursor() as cur:
                 cur.execute(
                     'INSERT INTO conversations (user_id, message, response) VALUES (%s, %s, %s)',
                     (user_id, message, response)
                 )
                 conn.commit()
+        except psycopg2.OperationalError as e:
+            print(f"❌ Database connection error in save_conversation: {e}")
+        except Exception as e:
+            print(f"❌ Error saving conversation: {e}")
         finally:
-            self.put_connection(conn)
+            if conn:
+                self.put_connection(conn)
 
     def get_conversation_history(self, user_id: str, limit: int = 5) -> List[Dict]:
         conn = self.get_connection()
@@ -1013,16 +1059,26 @@ def get_ai_response(prompt: str, system_prompt: Optional[str] = None) -> Optiona
 
 def get_ai_response_with_history(user_id: str, question: str) -> Optional[str]:
     """Get AI response with conversation history, improved error handling, and caching."""
-    history = db.get_conversation_history(user_id, 3)
+    try:
+        history = db.get_conversation_history(user_id, 3)
+    except Exception as e:
+        print(f"⚠️ Error fetching conversation history: {e}")
+        history = []
 
     history_str = json.dumps([(conv['message'], conv['response']) for conv in history])
     cache_key = f"{history_str}:{question}"
     cache_hash = str(deterministic_hash(cache_key))
 
-    cached_response = db.get_cached_response(cache_hash)
-    if cached_response:
-        db.save_conversation(user_id, question, cached_response)
-        return cached_response
+    try:
+        cached_response = db.get_cached_response(cache_hash)
+        if cached_response:
+            try:
+                db.save_conversation(user_id, question, cached_response)
+            except Exception as e:
+                print(f"⚠️ Failed to save cached conversation: {e}")
+            return cached_response
+    except Exception as e:
+        print(f"⚠️ Error checking cache: {e}")
 
     messages = [
         {
@@ -1151,8 +1207,76 @@ Are they related? (yes/no):"""
     word_overlap = answer_relevance_score(question, answer)
     return word_overlap >= 0.2
 
+def check_conversation_end(conversation_context: str) -> bool:
+    """Use AI RouterBot to determine if a conversation has ended."""
+    prompt = f"""Analyze this conversation and determine if it has ended. Reply with ONLY 'yes' or 'no'.
+
+Conversation:
+{conversation_context}
+
+Has the conversation naturally concluded? (yes/no):"""
+    
+    try:
+        response = get_ai_response(prompt, "You are RouterBot, a conversation analyzer. Reply ONLY with 'yes' or 'no'.")
+        if response:
+            response_lower = response.strip().lower()
+            has_ended = 'yes' in response_lower[:10]
+            return has_ended
+    except Exception as e:
+        print(f"⚠️ RouterBot conversation end check error: {e}")
+    
+    return False
+
+def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict]) -> bool:
+    """Use AI RouterBot to validate if conversation is worthy to store in knowledge base."""
+    qa_summary = "\n".join([f"Q: {qa['question']}\nA: {qa['answer']}\n" for qa in qa_pairs])
+    
+    prompt = f"""You are RouterBot, an AI that determines if Q&A content is educational and worthy of storage.
+
+Conversation context:
+{conversation_context}
+
+Q&A pairs extracted:
+{qa_summary}
+
+Is this content educational and worthy to store in a knowledge base? Consider:
+- Is it a genuine learning exchange (not just casual chat)?
+- Does it contain useful information?
+- Is it clear and understandable?
+
+Reply with ONLY 'yes' or 'no'."""
+    
+    try:
+        response = get_ai_response(prompt, "You are RouterBot, a knowledge base curator. Reply ONLY with 'yes' or 'no'.")
+        if response and not response.startswith("⚠️") and not response.startswith("❌"):
+            response_lower = response.strip().lower()
+            is_worthy = 'yes' in response_lower[:10]
+            if is_worthy:
+                print(f"✅ RouterBot APPROVED conversation for storage | {len(qa_pairs)} Q&A pairs")
+            else:
+                print(f"🚫 RouterBot REJECTED conversation | Reason: Not educational/worthy")
+            return is_worthy
+        else:
+            print(f"⚠️ RouterBot API error or timeout, using fallback validation")
+            if len(qa_pairs) == 1 and len(qa_pairs[0]['question']) > 10 and len(qa_pairs[0]['answer']) > 15:
+                print(f"   Fallback: Single Q&A with sufficient length - APPROVED")
+                return True
+            elif len(qa_pairs) > 1:
+                print(f"   Fallback: Multiple Q&A pairs - APPROVED")  
+                return True
+            else:
+                print(f"   Fallback: Content too short - REJECTED")
+                return False
+    except Exception as e:
+        print(f"⚠️ RouterBot validation exception: {e}, using fallback validation")
+        if len(qa_pairs) >= 1:
+            print(f"   Fallback: Has Q&A pairs - APPROVED")
+            return True
+    
+    return False
+
 def process_pending_conversation(user_id: str, conversation_data: Dict):
-    """Process a pending conversation after aggregation period - supports multiple Q&A pairs."""
+    """Process a pending conversation with AI RouterBot validation - supports single and multiple Q&A pairs."""
     try:
         questions = conversation_data.get('questions', [])
         all_answers = conversation_data.get('answers', [])
@@ -1161,7 +1285,8 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
             print(f"⚠️ Skipping conversation for user {user_id}: No questions")
             return
 
-        stored_count = 0
+        qa_pairs = []
+        conversation_context_parts = []
 
         for question_data in questions:
             question_text = question_data.get('text', '').strip()
@@ -1180,18 +1305,52 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
 
             related_answers = [
                 ans for ans in all_answers
-                if ans.get('reply_to') == question_id and is_teaching_content(ans['text'])
+                if ans.get('reply_to') == question_id
             ]
 
             if not related_answers:
+                print(f"⚠️ Skipping question '{question_text[:30]}...': No answers")
+                continue
+
+            teaching_answers = [ans for ans in related_answers if is_teaching_content(ans['text'])]
+            
+            if not teaching_answers:
                 print(f"⚠️ Skipping question '{question_text[:30]}...': No teaching answers")
                 continue
 
-            aggregated_answer = aggregate_messages([{'content': ans['text']} for ans in related_answers])
+            aggregated_answer = aggregate_messages([{'content': ans['text']} for ans in teaching_answers])
 
-            if not aggregated_answer or len(aggregated_answer) < 5:
+            if not aggregated_answer or len(aggregated_answer) < 3:
                 print(f"⚠️ Skipping question '{question_text[:30]}...': Answer too short")
                 continue
+
+            conversation_context_parts.append(f"Student: {question_text}")
+            for ans in teaching_answers:
+                conversation_context_parts.append(f"Teacher ({ans['author']}): {ans['text']}")
+
+            qa_pairs.append({
+                'question': question_text,
+                'answer': aggregated_answer,
+                'helpers': teaching_answers
+            })
+
+        if not qa_pairs:
+            print(f"⚠️ No valid Q&A pairs found for user {user_id}")
+            return
+
+        conversation_context = "\n".join(conversation_context_parts)
+        
+        is_worthy = check_conversation_worthiness(conversation_context, qa_pairs)
+        
+        if not is_worthy:
+            print(f"🚫 RouterBot rejected conversation for user {user_id}: Not worthy to store")
+            return
+
+        stored_count = 0
+
+        for qa_pair in qa_pairs:
+            question_text = qa_pair['question']
+            aggregated_answer = qa_pair['answer']
 
             if not validate_qa_relevance(question_text, aggregated_answer):
                 print(f"⚠️ Skipping '{question_text[:30]}...': Q&A not related (AI validation failed)")
@@ -1202,31 +1361,37 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
                 print(f"⚠️ Failed to generate embedding for: '{question_text[:50]}...'")
                 continue
 
+            # Console check before attempting to save
+            q_clear_check = calculate_q_clear(question_text)
+            a_substance_check = calculate_a_substance(aggregated_answer)
+            print(f"🔍 Check | Student: {question_text[:60]}... | Teacher: {aggregated_answer[:60]}... | Q_Clear: {q_clear_check:.2f} | A_Substance: {a_substance_check:.2f}")
+            
             saved = db.save_knowledge(question_text, aggregated_answer, embedding)
             if saved:
-                helper_names = ', '.join(set(ans['author'] for ans in related_answers))
+                helper_names = ', '.join(set(ans['author'] for ans in qa_pair['helpers']))
                 print(f"✅ KB STORED | Q: '{question_text[:50]}...' | A: '{aggregated_answer[:50]}...' | Helpers: {helper_names}")
                 stored_count += 1
             else:
-                print(f"⚠️ Failed to store KB: '{question_text[:50]}...'")
+                print(f"⚠️ Failed to store KB (duplicate/validation): '{question_text[:50]}...'")
 
         if stored_count > 0:
-            print(f"📦 Conversation complete for user {user_id}: {stored_count} Q&A pairs stored")
+            print(f"📦 Conversation complete for user {user_id}: {stored_count} Q&A pairs stored (RouterBot approved)")
 
     except Exception as e:
         print(f"❌ Error processing conversation for user {user_id}: {e}")
 
 async def process_expired_conversations():
-    """Background task to process conversations - 30-minute max window, 5-minute idle timeout."""
+    """Background task to process conversations - 10-minute max window, 1-minute AI RouterBot validation."""
     global pending_conversations
 
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
             current_time = datetime.now(timezone.utc)
             expired_users = []
 
+            # Acquire lock only to check and extract expired conversations
             with conversation_lock:
                 for user_id, conv_data in list(pending_conversations.items()):
                     last_message_time = conv_data.get('last_update')
@@ -1236,12 +1401,54 @@ async def process_expired_conversations():
                         time_since_last = (current_time - last_message_time).total_seconds()
                         time_since_first = (current_time - first_message_time).total_seconds() if first_message_time else 0
 
-                        if time_since_last >= 300 or time_since_first >= 1800:
-                            expired_users.append((user_id, conv_data))
+                        # 1-minute idle check with AI RouterBot validation
+                        if time_since_last >= 60:
+                            q_count = len(conv_data.get('questions', []))
+                            ans_count = len(conv_data.get('answers', []))
+                            
+                            # Build conversation context for AI validation
+                            if q_count >= 1 and ans_count >= 1:
+                                conversation_parts = []
+                                for q in conv_data['questions'][-5:]:
+                                    conversation_parts.append(f"Student: {q['text']}")
+                                for a in conv_data['answers'][-5:]:
+                                    conversation_parts.append(f"Teacher: {a['text']}")
+                                
+                                recent_context = "\n".join(conversation_parts)
+                                
+                                if len(recent_context) > 50:
+                                    # Store context for AI check outside lock
+                                    expired_users.append((user_id, conv_data, recent_context, True))
+                                    continue
+                        
+                        # 10-minute max window - force process
+                        if time_since_first >= 600:
+                            expired_users.append((user_id, conv_data, None, False))
                             del pending_conversations[user_id]
 
-            for user_id, conv_data in expired_users:
-                await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
+            # Process conversations with AI RouterBot validation (released from lock)
+            for item in expired_users:
+                if len(item) == 4:  # AI validation needed
+                    user_id, conv_data, context, needs_ai_check = item
+                    try:
+                        # AI RouterBot checks if conversation ended
+                        conv_ended = await asyncio.to_thread(check_conversation_end, context)
+                        
+                        if conv_ended:
+                            print(f"🎯 AI RouterBot: Conversation ended for {user_id} (1-min idle) - Processing...")
+                            with conversation_lock:
+                                pending_conversations.pop(user_id, None)
+                                if user_id in last_end_check_time:
+                                    del last_end_check_time[user_id]
+                            await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
+                        else:
+                            print(f"⏳ AI RouterBot: Conversation ongoing for {user_id} - Waiting...")
+                    except Exception as e:
+                        print(f"⚠️ AI RouterBot validation error for {user_id}: {e}")
+                else:  # Force process (10-min timeout)
+                    user_id, conv_data, _, _ = item
+                    print(f"⏰ Force processing {user_id} (10-min max window)")
+                    await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
 
         except Exception as e:
             print(f"❌ Error in background conversation processor: {e}")
@@ -1341,7 +1548,7 @@ async def on_ready():
         print(f'Error syncing commands: {e}')
 
     bot.loop.create_task(process_expired_conversations())
-    print("🔄 Started background conversation aggregation processor (30-min max window, 5-min idle timeout)")
+    print("🔄 Started background conversation processor (10-min max, 1-min AI RouterBot validation)")
 
 @bot.event
 async def on_member_join(member):
@@ -1431,7 +1638,7 @@ async def on_message(message):
     if str(message.channel.id) == LEARNING_CHANNEL:
         member = message.author
         has_helper_role = any(str(role.id) in HELPER_ROLES for role in member.roles)
-        has_student_role = any(str(role.id) == STUDENT_ROLE for role in member.roles)
+        has_student_role = any(str(role.id) == STUDENT_ROLE for role in member.roles) and not has_helper_role
 
         if message.reference and has_helper_role:
             try:
@@ -1470,6 +1677,7 @@ async def on_message(message):
                                 pending_conversations[student_user_id]['last_update'] = current_time
 
                                 ans_count = len(pending_conversations[student_user_id]['answers'])
+                                q_count = len(pending_conversations[student_user_id]['questions'])
                                 print(f"📝 Answer tracked ({ans_count} total) | Student: {referenced_msg.author.name} | Helper: {message.author.name} | Msg: '{answer_content[:40]}...'")
             except Exception as e:
                 print(f"Error in learning system: {e}")
@@ -1504,34 +1712,35 @@ async def on_message(message):
                     question_embedding = generate_embedding(question)
 
                     if question_embedding:
-                        top_matches = db.find_top_matches_with_confidence(question, question_embedding, top_n=3, min_semantic=0.65)
+                        top_matches = db.find_top_matches_with_confidence(question, question_embedding, top_n=3, min_semantic=KB_SIMILARITY_THRESHOLD)
 
                         if top_matches:
                             best_match = top_matches[0]
                             combined_conf = best_match['combined_confidence']
+                            semantic_sim = best_match['semantic_sim']
 
                             if combined_conf >= KB_REPLY_CONFIDENCE:
-                                rephrase_prompt = f"Helper's answer: {best_match['answer']}\n\nStudent's question: {question}"
-                                rephrased = await asyncio.to_thread(get_ai_response, rephrase_prompt, KB_REPLY_MODE)
+                                interpret_prompt = f"Teacher's explanation: {best_match['answer']}\n\nStudent's question: {question}\n\nBased on the teacher's explanation above, answer the student's question in your own words."
+                                ai_answer = await asyncio.to_thread(get_ai_response, interpret_prompt, KB_REPLY_MODE)
 
-                                if rephrased:
+                                if ai_answer:
                                     confidence_percent = int(combined_conf * 100)
                                     await message.reply(
-                                        f"{rephrased}\n\n||[KB match - {confidence_percent}% confidence]||"
+                                        f"{ai_answer}\n\n||[KB match - {confidence_percent}% confidence]||"
                                     )
-                                    print(f"📚 KB Reply (rephrased) | Confidence: {confidence_percent}% | Question: '{question[:50]}...'")
+                                    print(f"📚 KB Reply (AI interpreted) | Confidence: {confidence_percent}% | Semantic: {semantic_sim:.2f} | Question: '{question[:50]}...'")
 
                             elif combined_conf >= KB_SUGGEST_CONFIDENCE:
                                 confidence_percent = int(combined_conf * 100)
                                 await message.reply(
                                     f"{best_match['answer']}\n\n||[KB match - {confidence_percent}% confidence]||"
                                 )
-                                print(f"📚 KB Suggest | Confidence: {confidence_percent}% | Question: '{question[:50]}...'")
+                                print(f"📚 KB Suggest | Confidence: {confidence_percent}% | Semantic: {semantic_sim:.2f} | Question: '{question[:50]}...'")
 
                             else:
-                                print(f"🔇 Silent (confidence too low: {combined_conf:.2f}) | Question: '{question[:50]}...'")
+                                print(f"🔇 Silent (confidence too low: {combined_conf:.2f}, semantic: {semantic_sim:.2f}) | Question: '{question[:50]}...'")
                         else:
-                            print(f"🔇 Silent (no KB match) | Question: '{question[:50]}...'")
+                            print(f"🔇 Silent (no KB match above {KB_SIMILARITY_THRESHOLD:.2f} threshold) | Question: '{question[:50]}...'")
             except Exception as e:
                 print(f"Error in auto-reply system: {e}")
 
@@ -1811,18 +2020,15 @@ async def kbexport(interaction: discord.Interaction):
         return
 
     try:
-        await interaction.response.defer(ephemeral=True)
-    except discord.errors.HTTPException as e:
-        if e.code == 40060:
-            return
-        raise
-
-    try:
-        json_data, entry_count = db.export_knowledge_as_file()
+        # Export data before deferring to avoid timeout
+        json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
         
         if entry_count == 0:
-            await interaction.followup.send("📦 Knowledge base is empty!", ephemeral=True)
+            await interaction.response.send_message("📦 Knowledge base is empty!", ephemeral=True)
             return
+        
+        # Now defer since we have the data
+        await interaction.response.defer(ephemeral=True)
         
         if len(json_data) > 1900:
             file_buffer = io.BytesIO(json_data.encode('utf-8'))
@@ -1842,7 +2048,10 @@ async def kbexport(interaction: discord.Interaction):
                 ephemeral=True
             )
     except Exception as e:
-        await interaction.followup.send(f"❌ Error exporting knowledge base: {str(e)}", ephemeral=True)
+        try:
+            await interaction.followup.send(f"❌ Error exporting knowledge base: {str(e)}", ephemeral=True)
+        except:
+            await interaction.response.send_message(f"❌ Error exporting knowledge base: {str(e)}", ephemeral=True)
         print(f"Error in /kbexport: {e}")
 
 @bot.tree.command(name="extractkb", description="Extract knowledge base as JSON file (alias of /kbexport)")
@@ -1852,18 +2061,15 @@ async def extractkb(interaction: discord.Interaction):
         return
 
     try:
-        await interaction.response.defer(ephemeral=True)
-    except discord.errors.HTTPException as e:
-        if e.code == 40060:
-            return
-        raise
-
-    try:
-        json_data, entry_count = db.export_knowledge_as_file()
+        # Export data before deferring to avoid timeout
+        json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
         
         if entry_count == 0:
-            await interaction.followup.send("📦 Knowledge base is empty!", ephemeral=True)
+            await interaction.response.send_message("📦 Knowledge base is empty!", ephemeral=True)
             return
+        
+        # Now defer since we have the data
+        await interaction.response.defer(ephemeral=True)
         
         if len(json_data) > 1900:
             file_buffer = io.BytesIO(json_data.encode('utf-8'))
@@ -1883,7 +2089,10 @@ async def extractkb(interaction: discord.Interaction):
                 ephemeral=True
             )
     except Exception as e:
-        await interaction.followup.send(f"❌ Error extracting knowledge base: {str(e)}", ephemeral=True)
+        try:
+            await interaction.followup.send(f"❌ Error extracting knowledge base: {str(e)}", ephemeral=True)
+        except:
+            await interaction.response.send_message(f"❌ Error extracting knowledge base: {str(e)}", ephemeral=True)
         print(f"Error in /extractkb: {e}")
 
 @bot.tree.command(name="kbpurge", description="Remove knowledge base entries")
@@ -2023,9 +2232,8 @@ async def kbanalytics(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
-
     try:
+        await interaction.response.defer(ephemeral=True)
         stats = db.get_database_stats()
         duplicates = await asyncio.to_thread(db.find_all_duplicates)
         
@@ -2250,8 +2458,12 @@ async def setup(interaction: discord.Interaction):
         try:
             existing_message = await interaction.channel.fetch_message(int(existing_message_id))
             await existing_message.delete()
-        except:
-            pass
+        except discord.NotFound:
+            print(f"⚠️ Setup message {existing_message_id} not found, creating new one")
+        except discord.HTTPException as e:
+            print(f"⚠️ HTTP error deleting setup message: {e}")
+        except Exception as e:
+            print(f"⚠️ Error deleting setup message: {e}")
 
     embed = discord.Embed(
         title="Click the button and choose a role on what u wanna get pinged on",
