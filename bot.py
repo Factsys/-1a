@@ -30,7 +30,7 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 user_messages = {}
 user_message_timestamps = {}
 user_last_message_content = {}
-roast_chance = 0.5
+roast_chance = 0.1
 
 KB_REPLY_CONFIDENCE = 0.85
 KB_SUGGEST_CONFIDENCE = 0.75
@@ -1116,6 +1116,29 @@ def generate_embedding(text: str) -> Optional[List[float]]:
 
     return embedding
 
+def validate_qa_relevance(question: str, answer: str) -> bool:
+    """Use AI to validate if a question and answer are actually related."""
+    validation_prompt = f"""Analyze if this answer actually addresses the question. Reply with ONLY 'yes' or 'no'.
+
+Question: {question}
+Answer: {answer}
+
+Are they related? (yes/no):"""
+    
+    try:
+        response = get_ai_response(validation_prompt, "You are a strict validator. Reply ONLY with 'yes' or 'no'.")
+        if response:
+            response_lower = response.strip().lower()
+            is_valid = 'yes' in response_lower[:10]
+            if not is_valid:
+                print(f"🚫 AI rejected Q&A pair as unrelated | Q: '{question[:40]}...' | A: '{answer[:40]}...'")
+            return is_valid
+    except Exception as e:
+        print(f"⚠️ AI validation error: {e}, defaulting to basic validation")
+    
+    word_overlap = answer_relevance_score(question, answer)
+    return word_overlap >= 0.2
+
 def process_pending_conversation(user_id: str, conversation_data: Dict):
     """Process a pending conversation after aggregation period - supports multiple Q&A pairs."""
     try:
@@ -1158,6 +1181,10 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
                 print(f"⚠️ Skipping question '{question_text[:30]}...': Answer too short")
                 continue
 
+            if not validate_qa_relevance(question_text, aggregated_answer):
+                print(f"⚠️ Skipping '{question_text[:30]}...': Q&A not related (AI validation failed)")
+                continue
+
             embedding = generate_embedding(question_text)
             if not embedding:
                 print(f"⚠️ Failed to generate embedding for: '{question_text[:50]}...'")
@@ -1178,7 +1205,7 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
         print(f"❌ Error processing conversation for user {user_id}: {e}")
 
 async def process_expired_conversations():
-    """Background task to process conversations after 10-minute window."""
+    """Background task to process conversations - 30-minute max window, 5-minute idle timeout."""
     global pending_conversations
 
     while True:
@@ -1191,10 +1218,13 @@ async def process_expired_conversations():
             with conversation_lock:
                 for user_id, conv_data in list(pending_conversations.items()):
                     last_message_time = conv_data.get('last_update')
+                    first_message_time = conv_data.get('first_message')
+                    
                     if last_message_time:
-                        time_elapsed = (current_time - last_message_time).total_seconds()
+                        time_since_last = (current_time - last_message_time).total_seconds()
+                        time_since_first = (current_time - first_message_time).total_seconds() if first_message_time else 0
 
-                        if time_elapsed >= 600:
+                        if time_since_last >= 300 or time_since_first >= 1800:
                             expired_users.append((user_id, conv_data))
                             del pending_conversations[user_id]
 
@@ -1299,7 +1329,7 @@ async def on_ready():
         print(f'Error syncing commands: {e}')
 
     bot.loop.create_task(process_expired_conversations())
-    print("🔄 Started background conversation aggregation processor (10-minute window)")
+    print("🔄 Started background conversation aggregation processor (30-min max window, 5-min idle timeout)")
 
 @bot.event
 async def on_member_join(member):
@@ -1410,20 +1440,22 @@ async def on_message(message):
                             student_user_id = str(referenced_msg.author.id)
 
                             with conversation_lock:
+                                current_time = datetime.now(timezone.utc)
                                 if student_user_id not in pending_conversations:
                                     pending_conversations[student_user_id] = {
                                         'questions': [],
                                         'answers': [],
-                                        'last_update': datetime.now(timezone.utc)
+                                        'first_message': current_time,
+                                        'last_update': current_time
                                     }
 
                                 pending_conversations[student_user_id]['answers'].append({
                                     'text': answer_content,
                                     'author': message.author.name,
                                     'reply_to': str(referenced_msg.id),
-                                    'timestamp': datetime.now(timezone.utc)
+                                    'timestamp': current_time
                                 })
-                                pending_conversations[student_user_id]['last_update'] = datetime.now(timezone.utc)
+                                pending_conversations[student_user_id]['last_update'] = current_time
 
                                 ans_count = len(pending_conversations[student_user_id]['answers'])
                                 print(f"📝 Answer tracked ({ans_count} total) | Student: {referenced_msg.author.name} | Helper: {message.author.name} | Msg: '{answer_content[:40]}...'")
@@ -1438,19 +1470,21 @@ async def on_message(message):
                     student_user_id = str(message.author.id)
 
                     with conversation_lock:
+                        current_time = datetime.now(timezone.utc)
                         if student_user_id not in pending_conversations:
                             pending_conversations[student_user_id] = {
                                 'questions': [],
                                 'answers': [],
-                                'last_update': datetime.now(timezone.utc)
+                                'first_message': current_time,
+                                'last_update': current_time
                             }
 
                         pending_conversations[student_user_id]['questions'].append({
                             'text': question,
                             'id': str(message.id),
-                            'timestamp': datetime.now(timezone.utc)
+                            'timestamp': current_time
                         })
-                        pending_conversations[student_user_id]['last_update'] = datetime.now(timezone.utc)
+                        pending_conversations[student_user_id]['last_update'] = current_time
 
                         q_count = len(pending_conversations[student_user_id]['questions'])
                         print(f"❓ Question tracked ({q_count} total) | Student: {message.author.name} | Q: '{question[:40]}...'")
@@ -1717,7 +1751,12 @@ async def kbexport(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.errors.HTTPException as e:
+        if e.code == 40060:
+            return
+        raise
 
     try:
         json_data, entry_count = db.export_knowledge_as_file()
@@ -1753,7 +1792,12 @@ async def extractkb(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.errors.HTTPException as e:
+        if e.code == 40060:
+            return
+        raise
 
     try:
         json_data, entry_count = db.export_knowledge_as_file()
