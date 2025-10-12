@@ -347,7 +347,19 @@ class Database:
         if not db_url:
             raise ValueError("DATABASE_URL environment variable is not set")
 
-        self.db_url = db_url
+        db_url = db_url.strip()
+        if db_url.startswith("psql '"):
+            db_url = db_url[6:]
+        elif db_url.startswith('psql "'):
+            db_url = db_url[6:]
+        elif db_url.startswith("psql "):
+            db_url = db_url[5:]
+        
+        db_url = db_url.strip()
+        if db_url.endswith("'") or db_url.endswith('"'):
+            db_url = db_url[:-1]
+
+        self.db_url = db_url.strip()
         self.connection_pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
             maxconn=10,
@@ -1525,16 +1537,63 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-@bot.tree.command(name="say", description="Make the bot say something")
-@app_commands.describe(message="The message to say")
-async def say(interaction: discord.Interaction, message: str):
+@bot.tree.command(name="say", description="Make the bot say something or edit a previous message")
+@app_commands.describe(
+    message="The message to say or edit to",
+    message_id="Optional: Message ID to edit (bot's message only)"
+)
+async def say(interaction: discord.Interaction, message: str, message_id: Optional[str] = None):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    if message_id:
+        try:
+            target_message = await interaction.channel.fetch_message(int(message_id))
+            if target_message.author.id != bot.user.id:
+                await interaction.followup.send("❌ I can only edit my own messages!", ephemeral=True)
+                return
+            
+            await target_message.edit(content=message)
+            await interaction.followup.send(f"✅ Message edited successfully!", ephemeral=True)
+        except discord.NotFound:
+            await interaction.followup.send("❌ Message not found! Make sure the ID is correct.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ I don't have permission to edit that message.", ephemeral=True)
+        except ValueError:
+            await interaction.followup.send("❌ Invalid message ID format!", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error editing message: {str(e)}", ephemeral=True)
+    else:
+        await interaction.channel.send(message)
+        await interaction.followup.send("✅ Message sent!", ephemeral=True)
+
+@bot.tree.command(name="talk", description="Reply to a specific user's message")
+@app_commands.describe(
+    context="What you want the bot to say",
+    talk_id="The message ID to reply to"
+)
+async def talk(interaction: discord.Interaction, context: str, talk_id: str):
     if str(interaction.user.id) != OWNER_ID:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    await interaction.channel.send(message)
-    await interaction.followup.send("Message sent!", ephemeral=True)
+    
+    try:
+        target_message = await interaction.channel.fetch_message(int(talk_id))
+        await target_message.reply(context)
+        await interaction.followup.send(f"✅ Replied to {target_message.author.name}'s message!", ephemeral=True)
+    except discord.NotFound:
+        await interaction.followup.send("❌ Message not found! Make sure the ID is correct.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don't have permission to reply to that message.", ephemeral=True)
+    except ValueError:
+        await interaction.followup.send("❌ Invalid message ID format!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error replying to message: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="vibe", description="Get a vibe check from Bloom")
 async def vibe(interaction: discord.Interaction):
