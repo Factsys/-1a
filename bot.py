@@ -9,7 +9,9 @@ import random
 import asyncio
 import time
 import threading
-from typing import List, Dict, Optional, Tuple
+import difflib
+import io
+from typing import List, Dict, Optional, Tuple, Any, Callable
 from datetime import timedelta, datetime, timezone
 import discord
 from discord import app_commands
@@ -440,6 +442,46 @@ class Database:
         finally:
             self.put_connection(conn)
 
+    def fuzzy_text_similarity(self, text1: str, text2: str) -> float:
+        """Calculate fuzzy text similarity using difflib."""
+        return difflib.SequenceMatcher(None, text1.lower().strip(), text2.lower().strip()).ratio()
+    
+    def enhanced_duplicate_check(self, question: str, answer: str, embedding: List[float], 
+                                 semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85) -> Optional[Dict]:
+        """Enhanced duplicate detection using both semantic and fuzzy text matching."""
+        knowledge = self.get_all_knowledge()
+        
+        for item in knowledge:
+            stored_embedding = json.loads(item['embedding'])
+            semantic_sim = self.cosine_similarity(embedding, stored_embedding)
+            
+            if semantic_sim >= semantic_threshold:
+                fuzzy_q_sim = self.fuzzy_text_similarity(question, item['question'])
+                fuzzy_a_sim = self.fuzzy_text_similarity(answer, item['answer'])
+                
+                if fuzzy_q_sim >= fuzzy_threshold or (semantic_sim >= 0.92 and fuzzy_q_sim >= 0.75):
+                    return {
+                        **item,
+                        'semantic_similarity': semantic_sim,
+                        'fuzzy_q_similarity': fuzzy_q_sim,
+                        'fuzzy_a_similarity': fuzzy_a_sim,
+                        'match_type': 'semantic+fuzzy'
+                    }
+        
+        for item in knowledge:
+            fuzzy_q_sim = self.fuzzy_text_similarity(question, item['question'])
+            
+            if fuzzy_q_sim >= 0.90:
+                return {
+                    **item,
+                    'semantic_similarity': 0.0,
+                    'fuzzy_q_similarity': fuzzy_q_sim,
+                    'fuzzy_a_similarity': 0.0,
+                    'match_type': 'fuzzy_only'
+                }
+        
+        return None
+
     def save_knowledge(self, question: str, answer: str, embedding: List[float]) -> bool:
         try:
             if detect_pii(question) or detect_pii(answer):
@@ -457,9 +499,12 @@ class Database:
                 print(f"⚠️ Low answer substance ({a_substance:.2f}), not storing: '{question[:30]}...'")
                 return False
 
-            duplicate = self.find_similar_question(embedding, threshold=0.92)
+            duplicate = self.enhanced_duplicate_check(question, answer, embedding)
             if duplicate:
-                print(f"⚠️ Duplicate question detected (similarity: {duplicate['similarity']:.2f}), not storing: '{question[:30]}...'")
+                match_type = duplicate.get('match_type', 'unknown')
+                sem_sim = duplicate.get('semantic_similarity', 0)
+                fuzz_sim = duplicate.get('fuzzy_q_similarity', 0)
+                print(f"⚠️ Duplicate detected ({match_type}: sem={sem_sim:.2f}, fuzz={fuzz_sim:.2f}), not storing: '{question[:30]}...'")
                 return False
 
             conn = self.get_connection()
@@ -791,6 +836,88 @@ class Database:
                 )
                 result = cur.fetchone()
                 return result[0] if result else None
+        finally:
+            self.put_connection(conn)
+    
+    def find_all_duplicates(self, semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85) -> List[Dict]:
+        """Find all duplicate pairs in the knowledge base."""
+        knowledge = self.get_all_knowledge()
+        duplicates = []
+        processed_pairs = set()
+        
+        for i, item1 in enumerate(knowledge):
+            for j, item2 in enumerate(knowledge):
+                if i >= j:
+                    continue
+                
+                pair_key = tuple(sorted([item1['id'], item2['id']]))
+                if pair_key in processed_pairs:
+                    continue
+                
+                emb1 = json.loads(item1['embedding'])
+                emb2 = json.loads(item2['embedding'])
+                semantic_sim = self.cosine_similarity(emb1, emb2)
+                fuzzy_q_sim = self.fuzzy_text_similarity(item1['question'], item2['question'])
+                fuzzy_a_sim = self.fuzzy_text_similarity(item1['answer'], item2['answer'])
+                
+                is_duplicate = False
+                match_type = None
+                
+                if semantic_sim >= semantic_threshold and fuzzy_q_sim >= fuzzy_threshold:
+                    is_duplicate = True
+                    match_type = 'semantic+fuzzy'
+                elif fuzzy_q_sim >= 0.90:
+                    is_duplicate = True
+                    match_type = 'fuzzy_only'
+                elif semantic_sim >= 0.92 and fuzzy_q_sim >= 0.75:
+                    is_duplicate = True
+                    match_type = 'high_semantic'
+                
+                if is_duplicate:
+                    duplicates.append({
+                        'id1': item1['id'],
+                        'id2': item2['id'],
+                        'question1': item1['question'],
+                        'question2': item2['question'],
+                        'answer1': item1['answer'],
+                        'answer2': item2['answer'],
+                        'semantic_similarity': semantic_sim,
+                        'fuzzy_q_similarity': fuzzy_q_sim,
+                        'fuzzy_a_similarity': fuzzy_a_sim,
+                        'match_type': match_type,
+                        'created1': item1.get('created_at'),
+                        'created2': item2.get('created_at'),
+                        'q_clear1': item1.get('q_clear', 0),
+                        'q_clear2': item2.get('q_clear', 0),
+                        'a_substance1': item1.get('a_substance', 0),
+                        'a_substance2': item2.get('a_substance', 0)
+                    })
+                    processed_pairs.add(pair_key)
+        
+        return duplicates
+    
+    def remove_duplicate_entry(self, entry_id: int) -> bool:
+        """Remove a specific duplicate entry."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM knowledge WHERE id = %s', (entry_id,))
+                conn.commit()
+                return cur.rowcount > 0
+        finally:
+            self.put_connection(conn)
+    
+    def export_knowledge_as_file(self) -> tuple[str, int]:
+        """Export knowledge as formatted JSON string with entry count."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id, question, answer, created_at, q_clear, a_substance, approved FROM knowledge ORDER BY created_at DESC')
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                entries = [dict(zip(columns, row)) for row in rows]
+                json_str = json.dumps(entries, indent=2, default=str)
+                return json_str, len(entries)
         finally:
             self.put_connection(conn)
 
@@ -1584,7 +1711,7 @@ async def kbstats(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="kbexport", description="Export knowledge base as JSON")
+@bot.tree.command(name="kbexport", description="Export knowledge base as JSON file")
 async def kbexport(interaction: discord.Interaction):
     if str(interaction.user.id) != OWNER_ID:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
@@ -1592,21 +1719,35 @@ async def kbexport(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    json_data = db.export_knowledge_as_json()
+    try:
+        json_data, entry_count = db.export_knowledge_as_file()
+        
+        if entry_count == 0:
+            await interaction.followup.send("📦 Knowledge base is empty!", ephemeral=True)
+            return
+        
+        if len(json_data) > 1900:
+            file_buffer = io.BytesIO(json_data.encode('utf-8'))
+            file = discord.File(file_buffer, filename=f"knowledge_base_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
+            
+            await interaction.followup.send(
+                f"📦 **Knowledge Base Export**\n\n"
+                f"**Total Entries:** {entry_count}\n"
+                f"**Export Time:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                f"📎 Download attached file for full export.",
+                file=file,
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"📦 **Knowledge Base Export**\n\n**Entry count:** {entry_count}\n\n```json\n{json_data}\n```",
+                ephemeral=True
+            )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error exporting knowledge base: {str(e)}", ephemeral=True)
+        print(f"Error in /kbexport: {e}")
 
-    if len(json_data) > 1900:
-        await interaction.followup.send(
-            f"📦 Knowledge base exported!\n\n**Entry count:** {db.get_database_stats().get('knowledge_count', 0)}\n\n"
-            f"*Data is too large to display. Use the FastAPI endpoint `/kbexport` or database tools to access full export.*",
-            ephemeral=True
-        )
-    else:
-        await interaction.followup.send(
-            f"📦 Knowledge base exported:\n```json\n{json_data}\n```",
-            ephemeral=True
-        )
-
-@bot.tree.command(name="extractkb", description="Extract knowledge base as JSON (alias of /kbexport)")
+@bot.tree.command(name="extractkb", description="Extract knowledge base as JSON file (alias of /kbexport)")
 async def extractkb(interaction: discord.Interaction):
     if str(interaction.user.id) != OWNER_ID:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
@@ -1614,19 +1755,33 @@ async def extractkb(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    json_data = db.export_knowledge_as_json()
-
-    if len(json_data) > 1900:
-        await interaction.followup.send(
-            f"📦 Knowledge base exported:\n\n**Entry count:** {db.get_database_stats().get('knowledge_count', 0)}\n\n"
-            f"*Data is too large to display. Use the FastAPI endpoint `/kbexport` or database tools to access full export.*",
-            ephemeral=True
-        )
-    else:
-        await interaction.followup.send(
-            f"📦 Knowledge base exported:\n```json\n{json_data}\n```",
-            ephemeral=True
-        )
+    try:
+        json_data, entry_count = db.export_knowledge_as_file()
+        
+        if entry_count == 0:
+            await interaction.followup.send("📦 Knowledge base is empty!", ephemeral=True)
+            return
+        
+        if len(json_data) > 1900:
+            file_buffer = io.BytesIO(json_data.encode('utf-8'))
+            file = discord.File(file_buffer, filename=f"knowledge_base_extract_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
+            
+            await interaction.followup.send(
+                f"📦 **Knowledge Base Extract**\n\n"
+                f"**Total Entries:** {entry_count}\n"
+                f"**Extract Time:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                f"📎 Download attached file for full extract.",
+                file=file,
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"📦 **Knowledge Base Extract**\n\n**Entry count:** {entry_count}\n\n```json\n{json_data}\n```",
+                ephemeral=True
+            )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error extracting knowledge base: {str(e)}", ephemeral=True)
+        print(f"Error in /extractkb: {e}")
 
 @bot.tree.command(name="kbpurge", description="Remove knowledge base entries")
 @app_commands.describe(
@@ -1688,6 +1843,150 @@ async def kbreview(interaction: discord.Interaction):
         embed.set_footer(text=f"Showing 5 of {len(entries)} entries. Use /kbpurge to remove low-quality entries.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="dedupekb", description="Find and remove duplicate knowledge base entries")
+@app_commands.describe(
+    dry_run="Preview duplicates without removing them (default: True)",
+    semantic_threshold="Semantic similarity threshold 0.0-1.0 (default: 0.88)",
+    fuzzy_threshold="Fuzzy text similarity threshold 0.0-1.0 (default: 0.85)"
+)
+async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        duplicates = await asyncio.to_thread(db.find_all_duplicates, semantic_threshold, fuzzy_threshold)
+        
+        if not duplicates:
+            await interaction.followup.send("✅ No duplicates found in the knowledge base!", ephemeral=True)
+            return
+        
+        if dry_run:
+            embed = discord.Embed(
+                title="🔍 Duplicate Detection Report (Dry Run)",
+                description=f"Found **{len(duplicates)}** duplicate pairs",
+                color=discord.Color.orange()
+            )
+            
+            for i, dup in enumerate(duplicates[:5]):
+                older_id = dup['id1'] if dup.get('created1', '') < dup.get('created2', '') else dup['id2']
+                newer_id = dup['id2'] if older_id == dup['id1'] else dup['id1']
+                
+                embed.add_field(
+                    name=f"Pair {i+1}: IDs {dup['id1']} & {dup['id2']} ({dup['match_type']})",
+                    value=(
+                        f"**Similarity:** Semantic={dup['semantic_similarity']:.2f}, Fuzzy={dup['fuzzy_q_similarity']:.2f}\n"
+                        f"**Q1:** {dup['question1'][:60]}{'...' if len(dup['question1']) > 60 else ''}\n"
+                        f"**Q2:** {dup['question2'][:60]}{'...' if len(dup['question2']) > 60 else ''}\n"
+                        f"**Recommend:** Delete ID {older_id} (older), keep ID {newer_id}"
+                    ),
+                    inline=False
+                )
+            
+            if len(duplicates) > 5:
+                embed.set_footer(text=f"Showing 5 of {len(duplicates)} duplicates. Use dry_run=False to remove them.")
+            else:
+                embed.set_footer(text="Set dry_run=False to remove these duplicates.")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            removed_count = 0
+            for dup in duplicates:
+                older_id = dup['id1'] if dup.get('created1', '') < dup.get('created2', '') else dup['id2']
+                
+                if db.remove_duplicate_entry(older_id):
+                    removed_count += 1
+            
+            await interaction.followup.send(
+                f"✅ **Deduplication Complete!**\n\n"
+                f"**Duplicates Found:** {len(duplicates)}\n"
+                f"**Entries Removed:** {removed_count}\n"
+                f"**Entries Kept:** {len(duplicates) - removed_count}\n\n"
+                f"Older entries were removed, newer ones kept.",
+                ephemeral=True
+            )
+            print(f"🧹 Deduplication: {removed_count} duplicates removed by {interaction.user.name}")
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error during deduplication: {str(e)}", ephemeral=True)
+        print(f"Error in /dedupekb: {e}")
+
+@bot.tree.command(name="kbanalytics", description="Advanced knowledge base analytics and health metrics")
+async def kbanalytics(interaction: discord.Interaction):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        stats = db.get_database_stats()
+        duplicates = await asyncio.to_thread(db.find_all_duplicates)
+        
+        embed = discord.Embed(
+            title="📊 Knowledge Base Analytics",
+            color=discord.Color.blue()
+        )
+        
+        total_entries = stats.get('knowledge_count', 0)
+        duplicate_count = len(duplicates)
+        clean_entries = total_entries - duplicate_count
+        health_score = (clean_entries / total_entries * 100) if total_entries > 0 else 100
+        
+        embed.add_field(
+            name="📈 Database Health",
+            value=(
+                f"**Total Entries:** {total_entries}\n"
+                f"**Clean Entries:** {clean_entries}\n"
+                f"**Duplicates:** {duplicate_count}\n"
+                f"**Health Score:** {health_score:.1f}%"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⭐ Quality Metrics",
+            value=(
+                f"**Avg Question Clarity:** {stats.get('avg_q_clear', 0):.2f}/1.0\n"
+                f"**Avg Answer Substance:** {stats.get('avg_a_substance', 0):.2f}/1.0\n"
+                f"**High Quality Q/A:** {stats.get('high_q_clear', 0)} / {stats.get('high_a_substance', 0)}"
+            ),
+            inline=False
+        )
+        
+        if duplicates:
+            match_types = {}
+            for dup in duplicates:
+                match_type = dup.get('match_type', 'unknown')
+                match_types[match_type] = match_types.get(match_type, 0) + 1
+            
+            match_summary = '\n'.join([f"**{k}:** {v}" for k, v in match_types.items()])
+            
+            embed.add_field(
+                name="🔍 Duplicate Analysis",
+                value=match_summary,
+                inline=False
+            )
+        
+        embed.add_field(
+            name="💡 Recommendations",
+            value=(
+                f"{'✅ Database is healthy!' if health_score >= 95 else '⚠️ Run /dedupekb to clean duplicates' if health_score >= 80 else '🚨 Significant duplicates detected! Run /dedupekb immediately'}\n"
+                f"{'✅ Quality scores are good!' if stats.get('avg_q_clear', 0) >= 0.7 else '⚠️ Consider reviewing low quality entries with /kbreview'}"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Report generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error generating analytics: {str(e)}", ephemeral=True)
+        print(f"Error in /kbanalytics: {e}")
 
 @bot.tree.command(name="deletekb", description="Delete ALL knowledge base entries (WARNING: Cannot be undone!)")
 async def deletekb(interaction: discord.Interaction):
@@ -1865,6 +2164,169 @@ async def setup(interaction: discord.Interaction):
     await interaction.followup.send("✅ Role selection message has been set up!", ephemeral=True)
     print(f"🎯 Setup message created in channel {interaction.channel_id} by {interaction.user.name}")
 
+@bot.tree.command(name="poll", description="Create a poll with up to 10 options")
+@app_commands.describe(
+    question="The poll question",
+    option1="First option",
+    option2="Second option",
+    option3="Third option (optional)",
+    option4="Fourth option (optional)",
+    option5="Fifth option (optional)",
+    option6="Sixth option (optional)",
+    option7="Seventh option (optional)",
+    option8="Eighth option (optional)",
+    option9="Ninth option (optional)",
+    option10="Tenth option (optional)"
+)
+async def poll(interaction: discord.Interaction, question: str, option1: str, option2: str, 
+               option3: Optional[str] = None, option4: Optional[str] = None, 
+               option5: Optional[str] = None, option6: Optional[str] = None,
+               option7: Optional[str] = None, option8: Optional[str] = None,
+               option9: Optional[str] = None, option10: Optional[str] = None):
+    
+    options = [option1, option2, option3, option4, option5, option6, option7, option8, option9, option10]
+    options = [opt for opt in options if opt is not None]
+    
+    if len(options) < 2:
+        await interaction.response.send_message("You need at least 2 options for a poll!", ephemeral=True)
+        return
+    
+    if len(options) > 10:
+        await interaction.response.send_message("Maximum 10 options allowed!", ephemeral=True)
+        return
+    
+    emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
+    
+    description = '\n'.join([f"{emojis[i]} {opt}" for i, opt in enumerate(options)])
+    
+    embed = discord.Embed(
+        title=f"📊 {question}",
+        description=description,
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=f"Poll created by {interaction.user.name}")
+    
+    await interaction.response.send_message(embed=embed)
+    message = await interaction.original_response()
+    
+    for i in range(len(options)):
+        await message.add_reaction(emojis[i])
+
+@bot.tree.command(name="roll", description="Roll dice (e.g., 2d6, 1d20)")
+@app_commands.describe(dice="Dice notation (e.g., 2d6 for two six-sided dice)")
+async def roll(interaction: discord.Interaction, dice: str):
+    try:
+        parts = dice.lower().split('d')
+        if len(parts) != 2:
+            await interaction.response.send_message("Invalid format! Use format like: 2d6, 1d20, 3d10", ephemeral=True)
+            return
+        
+        num_dice = int(parts[0]) if parts[0] else 1
+        num_sides = int(parts[1])
+        
+        if num_dice < 1 or num_dice > 100:
+            await interaction.response.send_message("Number of dice must be between 1 and 100!", ephemeral=True)
+            return
+        
+        if num_sides < 2 or num_sides > 1000:
+            await interaction.response.send_message("Number of sides must be between 2 and 1000!", ephemeral=True)
+            return
+        
+        rolls = [random.randint(1, num_sides) for _ in range(num_dice)]
+        total = sum(rolls)
+        
+        if num_dice <= 10:
+            rolls_str = ', '.join(str(r) for r in rolls)
+            result = f"🎲 Rolling {dice}: [{rolls_str}] = **{total}**"
+        else:
+            result = f"🎲 Rolling {dice}: **{total}** (showing total only)"
+        
+        await interaction.response.send_message(result)
+    
+    except ValueError:
+        await interaction.response.send_message("Invalid dice format! Use format like: 2d6, 1d20, 3d10", ephemeral=True)
+
+@bot.tree.command(name="coinflip", description="Flip a coin")
+async def coinflip(interaction: discord.Interaction):
+    result = random.choice(["Heads", "Tails"])
+    emoji = "🪙" if result == "Heads" else "🎯"
+    await interaction.response.send_message(f"{emoji} **{result}!**")
+
+@bot.tree.command(name="serverinfo", description="Display server information")
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    
+    embed = discord.Embed(
+        title=f"ℹ️ {guild.name}",
+        color=discord.Color.blue()
+    )
+    
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    
+    embed.add_field(name="Owner", value=guild.owner.mention if guild.owner else "Unknown", inline=True)
+    embed.add_field(name="Server ID", value=str(guild.id), inline=True)
+    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    
+    embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+    embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="Channels", value=str(len(guild.channels)), inline=True)
+    
+    text_channels = len([c for c in guild.channels if isinstance(c, discord.TextChannel)])
+    voice_channels = len([c for c in guild.channels if isinstance(c, discord.VoiceChannel)])
+    
+    embed.add_field(name="Text Channels", value=str(text_channels), inline=True)
+    embed.add_field(name="Voice Channels", value=str(voice_channels), inline=True)
+    embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier}", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="userinfo", description="Display user information")
+@app_commands.describe(user="The user to get info about (leave empty for yourself)")
+async def userinfo(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    
+    embed = discord.Embed(
+        title=f"👤 {target.name}",
+        color=target.color if target.color != discord.Color.default() else discord.Color.blue()
+    )
+    
+    if target.avatar:
+        embed.set_thumbnail(url=target.avatar.url)
+    
+    embed.add_field(name="ID", value=str(target.id), inline=True)
+    embed.add_field(name="Nickname", value=target.nick if target.nick else "None", inline=True)
+    embed.add_field(name="Bot", value="Yes" if target.bot else "No", inline=True)
+    
+    embed.add_field(name="Account Created", value=target.created_at.strftime("%Y-%m-%d %H:%M UTC"), inline=False)
+    embed.add_field(name="Joined Server", value=target.joined_at.strftime("%Y-%m-%d %H:%M UTC") if target.joined_at else "Unknown", inline=False)
+    
+    roles = [role.mention for role in target.roles if role.name != "@everyone"]
+    if roles:
+        embed.add_field(name=f"Roles [{len(roles)}]", value=" ".join(roles[:10]) + ("..." if len(roles) > 10 else ""), inline=False)
+    else:
+        embed.add_field(name="Roles", value="No roles", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="avatar", description="Display user's avatar")
+@app_commands.describe(user="The user whose avatar to display (leave empty for yourself)")
+async def avatar(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    
+    embed = discord.Embed(
+        title=f"🖼️ {target.name}'s Avatar",
+        color=discord.Color.blue()
+    )
+    
+    if target.avatar:
+        embed.set_image(url=target.avatar.url)
+        embed.description = f"[Download]({target.avatar.url})"
+    else:
+        embed.description = "This user has no custom avatar."
+    
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
     if str(interaction.user.id) != OWNER_ID:
@@ -1894,6 +2356,19 @@ async def help_command(interaction: discord.Interaction):
             "**`/vibe`** - Get a vibe check from Bloom\n"
             "**`/quote`** - Get a motivational quote\n"
             "**`/8ball`** - Ask the magic 8-ball a question\n"
+            "**`/poll`** - Create a poll with up to 10 options\n"
+            "**`/roll`** - Roll dice (e.g., 2d6, 1d20)\n"
+            "**`/coinflip`** - Flip a coin\n"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Server & User Info",
+        value=(
+            "**`/serverinfo`** - Display server information\n"
+            "**`/userinfo`** - Display user information\n"
+            "**`/avatar`** - Display user's avatar\n"
         ),
         inline=False
     )
@@ -1912,16 +2387,26 @@ async def help_command(interaction: discord.Interaction):
         name="📊 Knowledge Base Admin (Owner Only)",
         value=(
             "**`/kbstats`** - View KB statistics and quality metrics\n"
-            "**`/kbexport`** - Export KB as JSON\n"
-            "**`/extractkb`** - Extract KB as JSON\n"
-            "**`/export`** - Export KB as JSON\n"
+            "**`/kbexport`** - Export KB as JSON file (auto file upload)\n"
+            "**`/extractkb`** - Extract KB as JSON file\n"
             "**`/kbpurge`** - Remove entries by ID or age\n"
             "**`/kbreview`** - Review borderline quality entries\n"
+            "**`/deletekb`** - Delete ALL KB entries (irreversible)\n"
+            "**`/store`** - Bulk import KB entries from JSON\n"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🥀Kb Features",
+        value=(
+            "**`/dedupekb`** - Find & remove duplicate entries (dry-run mode)\n"
+            "**`/kbanalytics`** - Advanced analytics & health metrics\n"
         ),
         inline=False
     )
 
-    embed.set_footer(text="Bloom Bot | Use commands to interact!")
+    embed.set_footer(text="Bloom Bot")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
