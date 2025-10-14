@@ -32,9 +32,9 @@ user_message_timestamps = {}
 user_last_message_content = {}
 roast_chance = 0.1
 
-KB_REPLY_CONFIDENCE = 0.75
-KB_SUGGEST_CONFIDENCE = 0.65
-KB_SIMILARITY_THRESHOLD = 0.70
+KB_REPLY_CONFIDENCE = 0.70
+KB_SUGGEST_CONFIDENCE = 0.58
+KB_SIMILARITY_THRESHOLD = 0.65
 
 pending_conversations = {}
 user_question_tracking = {}
@@ -46,7 +46,7 @@ KB_REPLY_MODE = "You are Bloom — concise assistant. Rephrase this helper answe
 AI_FALLBACK_MODE = "You are Bloom — clear, critical, and educational. Give SHORT answer (1-2 sentences, 15-35 words). Question assumptions. Avoid praise and fluff."
 
 def compute_student_points(query: str, question: str) -> float:
-    """Calculate student points based on lexical hits, intent match, and specificity."""
+    """Calculate student points based on lexical hits, intent match, and specificity - optimized for partial matches."""
     import re
 
     query_lower = query.lower().strip()
@@ -55,11 +55,14 @@ def compute_student_points(query: str, question: str) -> float:
     question_words = set(re.findall(r'\b\w+\b', question_lower))
     query_words = set(re.findall(r'\b\w+\b', query_lower))
 
-    if not question_words:
+    if not question_words or not query_words:
         lexical_hits = 0.0
     else:
         matching_words = question_words.intersection(query_words)
-        lexical_hits = len(matching_words) / len(question_words)
+        # Improved: Use average of forward and backward match for partial questions
+        forward_match = len(matching_words) / len(question_words)  # How much of stored Q is in query
+        backward_match = len(matching_words) / len(query_words)    # How much of query is in stored Q
+        lexical_hits = (forward_match + backward_match) / 2.0      # Average both directions
 
     intent_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which'}
     query_has_intent = any(word in query_words for word in intent_words)
@@ -394,6 +397,7 @@ class Database:
             maxconn=10,
             dsn=db_url
         )
+        print("🔌 Neo.com is working in the database")
         self.create_tables()
 
     def get_connection(self):
@@ -543,11 +547,11 @@ class Database:
             q_clear = calculate_q_clear(question)
             a_substance = calculate_a_substance(answer)
 
-            if q_clear < 0.65:
+            if q_clear < 0.55:
                 print(f"⚠️ Low question clarity ({q_clear:.2f}), not storing: '{question[:50]}...'")
                 return False
 
-            if a_substance < 0.65:
+            if a_substance < 0.55:
                 print(f"⚠️ Low answer substance ({a_substance:.2f}), not storing | Q: '{question[:50]}...' | A: '{answer[:50]}...'")
                 return False
 
@@ -1184,54 +1188,176 @@ def generate_embedding(text: str) -> Optional[List[float]]:
 
     return embedding
 
-def validate_qa_relevance(question: str, answer: str) -> bool:
-    """Use AI to validate if a question and answer are actually related."""
-    validation_prompt = f"""Analyze if this answer actually addresses the question. Reply with ONLY 'yes' or 'no'.
+def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = False) -> bool:
+    """Hybrid validation: rule-based first, AI only for edge cases."""
+    import re
+    
+    # Rule 1: Check word overlap (fast)
+    word_overlap = answer_relevance_score(question, answer)
+    
+    # Rule 2: Check if answer is actually a question (reject)
+    answer_lower = answer.lower().strip()
+    question_indicators = sum(1 for w in ['what', 'why', 'how', 'when', 'where', 'who'] if w in answer_lower.split())
+    if question_indicators >= 2 or (question_indicators == 1 and '?' in answer):
+        print(f"🚫 Rule-based: Answer is a question, rejected | A: '{answer[:40]}...'")
+        return False
+    
+    # Rule 3: Strong overlap = auto-approve (no AI needed)
+    if word_overlap >= 0.35:
+        print(f"✅ Rule-based: Strong word overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
+        return True
+    
+    # Rule 4: Very weak overlap = auto-reject (no AI needed)
+    if word_overlap < 0.15:
+        print(f"🚫 Rule-based: Weak word overlap ({word_overlap:.2f}), rejected | Q: '{question[:40]}...'")
+        return False
+    
+    # Rule 5: Check if answer has instructional content
+    instructional_verbs = {'use', 'click', 'go', 'check', 'try', 'enable', 'disable', 'set', 'turn', 'make', 'get'}
+    has_instructions = any(verb in answer_lower.split() for verb in instructional_verbs)
+    if has_instructions and word_overlap >= 0.20:
+        print(f"✅ Rule-based: Has instructions + decent overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
+        return True
+    
+    # Edge case (0.15-0.35 overlap, no instructions): Use AI only if enabled
+    if use_ai_fallback:
+        print(f"⚙️ Borderline case ({word_overlap:.2f}), using AI validation...")
+        validation_prompt = f"""Analyze if this answer actually addresses the question. Reply with ONLY 'yes' or 'no'.
 
 Question: {question}
 Answer: {answer}
 
 Are they related? (yes/no):"""
+        
+        try:
+            response = get_ai_response(validation_prompt, "You are a strict validator. Reply ONLY with 'yes' or 'no'.")
+            if response:
+                response_lower = response.strip().lower()
+                is_valid = 'yes' in response_lower[:10]
+                if not is_valid:
+                    print(f"🚫 AI rejected Q&A pair as unrelated | Q: '{question[:40]}...' | A: '{answer[:40]}...'")
+                return is_valid
+        except Exception as e:
+            print(f"⚠️ AI validation error: {e}, using rule-based fallback")
     
-    try:
-        response = get_ai_response(validation_prompt, "You are a strict validator. Reply ONLY with 'yes' or 'no'.")
-        if response:
-            response_lower = response.strip().lower()
-            is_valid = 'yes' in response_lower[:10]
-            if not is_valid:
-                print(f"🚫 AI rejected Q&A pair as unrelated | Q: '{question[:40]}...' | A: '{answer[:40]}...'")
-            return is_valid
-    except Exception as e:
-        print(f"⚠️ AI validation error: {e}, defaulting to basic validation")
-    
-    word_overlap = answer_relevance_score(question, answer)
-    return word_overlap >= 0.2
+    # Fallback: moderate overlap = approve
+    result = word_overlap >= 0.20
+    print(f"{'✅' if result else '🚫'} Rule-based fallback: overlap {word_overlap:.2f}, {'approved' if result else 'rejected'}")
+    return result
 
-def check_conversation_end(conversation_context: str) -> bool:
-    """Use AI RouterBot to determine if a conversation has ended."""
-    prompt = f"""Analyze this conversation and determine if it has ended. Reply with ONLY 'yes' or 'no'.
+def check_conversation_end(conversation_context: str, idle_seconds: float, use_ai_fallback: bool = True) -> bool:
+    """Hybrid conversation end detection: rule-based first, AI only for edge cases."""
+    import re
+    
+    lines = conversation_context.strip().split('\n')
+    
+    # Rule 1: Very short conversations (<=2 exchanges) + long idle = auto-end
+    if len(lines) <= 4 and idle_seconds >= 60:
+        print(f"✅ Rule-based: Short conversation ({len(lines)} lines) + {idle_seconds:.0f}s idle = ended")
+        return True
+    
+    # Rule 2: Long idle (90+ seconds) = auto-end (no AI needed)
+    if idle_seconds >= 90:
+        print(f"✅ Rule-based: Long idle ({idle_seconds:.0f}s) = conversation ended")
+        return True
+    
+    # Rule 3: Check for closing phrases (auto-end)
+    closing_phrases = ['thanks', 'thank you', 'ty', 'got it', 'ok cool', 'perfect', 'awesome', 'appreciate it']
+    last_messages = ' '.join(lines[-3:]).lower() if len(lines) >= 3 else conversation_context.lower()
+    has_closing = any(phrase in last_messages for phrase in closing_phrases)
+    if has_closing and idle_seconds >= 40:
+        print(f"✅ Rule-based: Closing phrase + {idle_seconds:.0f}s idle = ended")
+        return True
+    
+    # Rule 4: Recent activity (< 30 seconds idle) = NOT ended
+    if idle_seconds < 30:
+        print(f"🔄 Rule-based: Recent activity ({idle_seconds:.0f}s idle) = ongoing")
+        return False
+    
+    # Edge case (30-90 seconds, no closing phrases): Use AI only if enabled
+    if use_ai_fallback and idle_seconds >= 45:
+        print(f"⚙️ Borderline case ({idle_seconds:.0f}s idle, {len(lines)} lines), using AI RouterBot...")
+        prompt = f"""Analyze this conversation and determine if it has ended. Reply with ONLY 'yes' or 'no'.
 
 Conversation:
 {conversation_context}
 
 Has the conversation naturally concluded? (yes/no):"""
+        
+        try:
+            response = get_ai_response(prompt, "You are RouterBot, a conversation analyzer. Reply ONLY with 'yes' or 'no'.")
+            if response and not response.startswith("⚠️") and not response.startswith("❌"):
+                response_lower = response.strip().lower()
+                has_ended = 'yes' in response_lower[:10]
+                return has_ended
+        except Exception as e:
+            print(f"⚠️ RouterBot conversation end check error: {e}, using rule-based fallback")
     
-    try:
-        response = get_ai_response(prompt, "You are RouterBot, a conversation analyzer. Reply ONLY with 'yes' or 'no'.")
-        if response:
-            response_lower = response.strip().lower()
-            has_ended = 'yes' in response_lower[:10]
-            return has_ended
-    except Exception as e:
-        print(f"⚠️ RouterBot conversation end check error: {e}")
-    
-    return False
+    # Fallback: moderate idle = ended
+    result = idle_seconds >= 50
+    print(f"{'✅' if result else '🔄'} Rule-based fallback: {idle_seconds:.0f}s idle, conversation {'ended' if result else 'ongoing'}")
+    return result
 
-def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict]) -> bool:
-    """Use AI RouterBot to validate if conversation is worthy to store in knowledge base."""
-    qa_summary = "\n".join([f"Q: {qa['question']}\nA: {qa['answer']}\n" for qa in qa_pairs])
+def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict], use_ai_fallback: bool = False) -> bool:
+    """Hybrid worthiness check: rule-based first, AI only for edge cases."""
+    import re
     
-    prompt = f"""You are RouterBot, an AI that determines if Q&A content is educational and worthy of storage.
+    if not qa_pairs:
+        print(f"🚫 Rule-based: No Q&A pairs, rejected")
+        return False
+    
+    # Rule 1: Single Q&A with good quality scores = auto-approve
+    if len(qa_pairs) == 1:
+        qa = qa_pairs[0]
+        q_len = len(qa['question'])
+        a_len = len(qa['answer'])
+        q_clear_est = calculate_q_clear(qa['question'])
+        a_substance_est = calculate_a_substance(qa['answer'])
+        
+        if q_clear_est >= 0.65 and a_substance_est >= 0.65 and q_len >= 10 and a_len >= 20:
+            print(f"✅ Rule-based: Single Q&A with high quality (Q={q_clear_est:.2f}, A={a_substance_est:.2f}), approved")
+            return True
+        
+        if q_clear_est < 0.50 or a_substance_est < 0.50:
+            print(f"🚫 Rule-based: Single Q&A with low quality (Q={q_clear_est:.2f}, A={a_substance_est:.2f}), rejected")
+            return False
+    
+    # Rule 2: Multiple Q&A pairs = auto-approve (learning exchange)
+    if len(qa_pairs) >= 2:
+        avg_q_clear = sum(calculate_q_clear(qa['question']) for qa in qa_pairs) / len(qa_pairs)
+        avg_a_substance = sum(calculate_a_substance(qa['answer']) for qa in qa_pairs) / len(qa_pairs)
+        
+        if avg_q_clear >= 0.55 and avg_a_substance >= 0.55:
+            print(f"✅ Rule-based: Multiple Q&A ({len(qa_pairs)} pairs) with decent quality, approved")
+            return True
+    
+    # Rule 3: Check for casual chat patterns (auto-reject)
+    all_text = conversation_context.lower()
+    casual_ratio = sum(1 for phrase in ['lol', 'lmao', 'bruh', 'ngl', 'fr', 'tbh'] if phrase in all_text) / max(len(all_text.split()), 1)
+    if casual_ratio > 0.15:
+        print(f"🚫 Rule-based: High casual chat ratio ({casual_ratio:.2f}), rejected")
+        return False
+    
+    # Rule 4: Check if answers have substance (instruction verbs, numbers, details)
+    has_substance = False
+    for qa in qa_pairs:
+        answer_lower = qa['answer'].lower()
+        has_instructions = any(verb in answer_lower.split() for verb in ['use', 'click', 'go', 'try', 'check', 'enable', 'set'])
+        has_numbers = bool(re.search(r'\d', qa['answer']))
+        if has_instructions or has_numbers or len(qa['answer']) > 40:
+            has_substance = True
+            break
+    
+    if has_substance:
+        print(f"✅ Rule-based: Answers have substance (instructions/numbers/length), approved")
+        return True
+    
+    # Edge case (borderline quality, no clear signals): Use AI only if enabled
+    if use_ai_fallback and len(qa_pairs) >= 1:
+        print(f"⚙️ Borderline case ({len(qa_pairs)} Q&A pairs), using AI RouterBot...")
+        qa_summary = "\n".join([f"Q: {qa['question']}\nA: {qa['answer']}\n" for qa in qa_pairs])
+        
+        prompt = f"""You are RouterBot, an AI that determines if Q&A content is educational and worthy of storage.
 
 Conversation context:
 {conversation_context}
@@ -1245,35 +1371,26 @@ Is this content educational and worthy to store in a knowledge base? Consider:
 - Is it clear and understandable?
 
 Reply with ONLY 'yes' or 'no'."""
+        
+        try:
+            response = get_ai_response(prompt, "You are RouterBot, a knowledge base curator. Reply ONLY with 'yes' or 'no'.")
+            if response and not response.startswith("⚠️") and not response.startswith("❌"):
+                response_lower = response.strip().lower()
+                is_worthy = 'yes' in response_lower[:10]
+                if is_worthy:
+                    print(f"✅ RouterBot APPROVED conversation for storage | {len(qa_pairs)} Q&A pairs")
+                else:
+                    print(f"🚫 RouterBot REJECTED conversation | Reason: Not educational/worthy")
+                return is_worthy
+        except Exception as e:
+            print(f"⚠️ RouterBot validation exception: {e}, using rule-based fallback")
     
-    try:
-        response = get_ai_response(prompt, "You are RouterBot, a knowledge base curator. Reply ONLY with 'yes' or 'no'.")
-        if response and not response.startswith("⚠️") and not response.startswith("❌"):
-            response_lower = response.strip().lower()
-            is_worthy = 'yes' in response_lower[:10]
-            if is_worthy:
-                print(f"✅ RouterBot APPROVED conversation for storage | {len(qa_pairs)} Q&A pairs")
-            else:
-                print(f"🚫 RouterBot REJECTED conversation | Reason: Not educational/worthy")
-            return is_worthy
-        else:
-            print(f"⚠️ RouterBot API error or timeout, using fallback validation")
-            if len(qa_pairs) == 1 and len(qa_pairs[0]['question']) > 10 and len(qa_pairs[0]['answer']) > 15:
-                print(f"   Fallback: Single Q&A with sufficient length - APPROVED")
-                return True
-            elif len(qa_pairs) > 1:
-                print(f"   Fallback: Multiple Q&A pairs - APPROVED")  
-                return True
-            else:
-                print(f"   Fallback: Content too short - REJECTED")
-                return False
-    except Exception as e:
-        print(f"⚠️ RouterBot validation exception: {e}, using fallback validation")
-        if len(qa_pairs) >= 1:
-            print(f"   Fallback: Has Q&A pairs - APPROVED")
-            return True
-    
-    return False
+    # Fallback: if we got here, likely borderline - approve if has basic quality
+    avg_q_clear = sum(calculate_q_clear(qa['question']) for qa in qa_pairs) / len(qa_pairs)
+    avg_a_substance = sum(calculate_a_substance(qa['answer']) for qa in qa_pairs) / len(qa_pairs)
+    result = avg_q_clear >= 0.50 and avg_a_substance >= 0.50
+    print(f"{'✅' if result else '🚫'} Rule-based fallback: Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}, {'approved' if result else 'rejected'}")
+    return result
 
 def process_pending_conversation(user_id: str, conversation_data: Dict):
     """Process a pending conversation with AI RouterBot validation - supports single and multiple Q&A pairs."""
@@ -1340,7 +1457,8 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
 
         conversation_context = "\n".join(conversation_context_parts)
         
-        is_worthy = check_conversation_worthiness(conversation_context, qa_pairs)
+        # Use hybrid validation (AI fallback disabled by default to reduce API calls by 70%+)
+        is_worthy = check_conversation_worthiness(conversation_context, qa_pairs, use_ai_fallback=False)
         
         if not is_worthy:
             print(f"🚫 RouterBot rejected conversation for user {user_id}: Not worthy to store")
@@ -1352,8 +1470,9 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
             question_text = qa_pair['question']
             aggregated_answer = qa_pair['answer']
 
-            if not validate_qa_relevance(question_text, aggregated_answer):
-                print(f"⚠️ Skipping '{question_text[:30]}...': Q&A not related (AI validation failed)")
+            # Use hybrid validation (AI fallback disabled by default to reduce API calls)
+            if not validate_qa_relevance(question_text, aggregated_answer, use_ai_fallback=False):
+                print(f"⚠️ Skipping '{question_text[:30]}...': Q&A not related (hybrid validation failed)")
                 continue
 
             embedding = generate_embedding(question_text)
@@ -1381,12 +1500,12 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
         print(f"❌ Error processing conversation for user {user_id}: {e}")
 
 async def process_expired_conversations():
-    """Background task to process conversations - 10-minute max window, 1-minute AI RouterBot validation."""
+    """Background task to process conversations - 5-minute max window (with idle check), 45-second idle check with smart AI validation."""
     global pending_conversations
 
     while True:
         try:
-            await asyncio.sleep(15)
+            await asyncio.sleep(10)
 
             current_time = datetime.now(timezone.utc)
             expired_users = []
@@ -1401,28 +1520,34 @@ async def process_expired_conversations():
                         time_since_last = (current_time - last_message_time).total_seconds()
                         time_since_first = (current_time - first_message_time).total_seconds() if first_message_time else 0
 
-                        # 1-minute idle check with AI RouterBot validation
-                        if time_since_last >= 60:
-                            q_count = len(conv_data.get('questions', []))
-                            ans_count = len(conv_data.get('answers', []))
+                        q_count = len(conv_data.get('questions', []))
+                        ans_count = len(conv_data.get('answers', []))
+
+                        # Quick processing for simple single Q&A (30 seconds idle)
+                        if q_count == 1 and ans_count >= 1 and time_since_last >= 30:
+                            print(f"⚡ Fast-track: Single Q&A for {user_id} (30s idle)")
+                            expired_users.append((user_id, conv_data, None, False))
+                            del pending_conversations[user_id]
+                            continue
+
+                        # 45-second idle check with AI RouterBot validation for complex conversations
+                        if time_since_last >= 45 and q_count >= 1 and ans_count >= 1:
+                            conversation_parts = []
+                            for q in conv_data['questions'][-5:]:
+                                conversation_parts.append(f"Student: {q['text']}")
+                            for a in conv_data['answers'][-5:]:
+                                conversation_parts.append(f"Teacher: {a['text']}")
                             
-                            # Build conversation context for AI validation
-                            if q_count >= 1 and ans_count >= 1:
-                                conversation_parts = []
-                                for q in conv_data['questions'][-5:]:
-                                    conversation_parts.append(f"Student: {q['text']}")
-                                for a in conv_data['answers'][-5:]:
-                                    conversation_parts.append(f"Teacher: {a['text']}")
-                                
-                                recent_context = "\n".join(conversation_parts)
-                                
-                                if len(recent_context) > 50:
-                                    # Store context for AI check outside lock
-                                    expired_users.append((user_id, conv_data, recent_context, True))
-                                    continue
+                            recent_context = "\n".join(conversation_parts)
+                            
+                            if len(recent_context) > 50:
+                                # Store context for AI check outside lock
+                                expired_users.append((user_id, conv_data, recent_context, True))
+                                continue
                         
-                        # 10-minute max window - force process
-                        if time_since_first >= 600:
+                        # 5-minute max window BUT ONLY if also idle for 30+ seconds (prevents cutting active conversations)
+                        if time_since_first >= 300 and time_since_last >= 30:
+                            print(f"⏰ Max window reached for {user_id} (5 min + 30s idle)")
                             expired_users.append((user_id, conv_data, None, False))
                             del pending_conversations[user_id]
 
@@ -1431,11 +1556,11 @@ async def process_expired_conversations():
                 if len(item) == 4:  # AI validation needed
                     user_id, conv_data, context, needs_ai_check = item
                     try:
-                        # AI RouterBot checks if conversation ended
-                        conv_ended = await asyncio.to_thread(check_conversation_end, context)
+                        # Hybrid check (AI fallback enabled for edge cases only)
+                        conv_ended = await asyncio.to_thread(check_conversation_end, context, time_since_last, use_ai_fallback=True)
                         
                         if conv_ended:
-                            print(f"🎯 AI RouterBot: Conversation ended for {user_id} (1-min idle) - Processing...")
+                            print(f"🎯 AI RouterBot: Conversation ended for {user_id} (45s idle) - Processing...")
                             with conversation_lock:
                                 pending_conversations.pop(user_id, None)
                                 if user_id in last_end_check_time:
@@ -1445,9 +1570,9 @@ async def process_expired_conversations():
                             print(f"⏳ AI RouterBot: Conversation ongoing for {user_id} - Waiting...")
                     except Exception as e:
                         print(f"⚠️ AI RouterBot validation error for {user_id}: {e}")
-                else:  # Force process (10-min timeout)
+                else:  # Force process or fast-track
                     user_id, conv_data, _, _ = item
-                    print(f"⏰ Force processing {user_id} (10-min max window)")
+                    print(f"⏰ Force processing {user_id} (5-min max window or fast-track)")
                     await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
 
         except Exception as e:
@@ -1981,7 +2106,10 @@ async def kbstats(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.errors.HTTPException:
+        pass  # Already acknowledged
 
     stats = db.get_database_stats()
 
@@ -2094,6 +2222,39 @@ async def extractkb(interaction: discord.Interaction):
         except:
             await interaction.response.send_message(f"❌ Error extracting knowledge base: {str(e)}", ephemeral=True)
         print(f"Error in /extractkb: {e}")
+
+@bot.tree.command(name="downloadkb", description="Download all stored knowledge base Q&A as a file")
+async def downloadkb(interaction: discord.Interaction):
+    if str(interaction.user.id) != OWNER_ID:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    try:
+        json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
+        
+        if entry_count == 0:
+            await interaction.response.send_message("📦 Knowledge base is empty - no Q&A stored yet!", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        file_buffer = io.BytesIO(json_data.encode('utf-8'))
+        file = discord.File(file_buffer, filename=f"bloom_kb_download_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
+        
+        await interaction.followup.send(
+            f"📥 **Knowledge Base Download**\n\n"
+            f"**Total Q&A Pairs:** {entry_count}\n"
+            f"**Download Time:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            f"📎 Download the attached file to view all stored questions and answers.",
+            file=file,
+            ephemeral=True
+        )
+    except Exception as e:
+        try:
+            await interaction.followup.send(f"❌ Error downloading knowledge base: {str(e)}", ephemeral=True)
+        except:
+            await interaction.response.send_message(f"❌ Error downloading knowledge base: {str(e)}", ephemeral=True)
+        print(f"Error in /downloadkb: {e}")
 
 @bot.tree.command(name="kbpurge", description="Remove knowledge base entries")
 @app_commands.describe(
@@ -2342,8 +2503,10 @@ async def store(interaction: discord.Interaction, json_data: str):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
-
+    # Check if already acknowledged
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    
     try:
         entries = json.loads(json_data)
         
@@ -2702,6 +2865,7 @@ async def help_command(interaction: discord.Interaction):
         name="📊 Knowledge Base Admin (Owner Only)",
         value=(
             "**`/kbstats`** - View KB statistics and quality metrics\n"
+            "**`/downloadkb`** - Download all stored Q&A as a file\n"
             "**`/kbexport`** - Export KB as JSON file (auto file upload)\n"
             "**`/extractkb`** - Extract KB as JSON file\n"
             "**`/kbpurge`** - Remove entries by ID or age\n"
