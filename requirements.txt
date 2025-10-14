@@ -18,3 +18,12 @@ python-dotenv
 requests
 scikit-learn
 uvicorn
+chromadb
+discord.py
+fastapi
+numpy
+psycopg2-binary
+python-dotenv
+requests
+scikit-learn
+uvicorn
