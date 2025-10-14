@@ -21,7 +21,7 @@ TRADING_CHANNEL = '1418976581099065355'
 AUTO_KICK_CHANNEL = '1411335541873709167'
 HELPER_ROLES = ['1418434355650625676', '1352853011424219158', '1372300233240739920']
 STUDENT_ROLE = '1341949236471926805'
-OWNER_ID = '1334138321412296725'
+OWNER_IDS = ['1334138321412296725', '829256979716898826']
 PORT = int(os.getenv('PORT', 5000))
 
 TOKEN = os.getenv('TOKEN')
@@ -2015,7 +2015,7 @@ async def on_message(message):
     message_id="Optional: Message ID to edit (bot's message only)"
 )
 async def say(interaction: discord.Interaction, message: str, message_id: Optional[str] = None):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
     
@@ -2048,7 +2048,7 @@ async def say(interaction: discord.Interaction, message: str, message_id: Option
     talk_id="The message ID to reply to"
 )
 async def talk(interaction: discord.Interaction, context: str, talk_id: str):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2069,7 +2069,7 @@ async def talk(interaction: discord.Interaction, context: str, talk_id: str):
 
 @bot.tree.command(name="vibe", description="Get a vibe check from Bloom")
 async def vibe(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2087,7 +2087,7 @@ async def vibe(interaction: discord.Interaction):
 
 @bot.tree.command(name="quote", description="Get a motivational quote")
 async def quote(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2108,7 +2108,7 @@ async def quote(interaction: discord.Interaction):
 @bot.tree.command(name="8ball", description="Ask the magic 8-ball a question")
 @app_commands.describe(question="Your yes/no question")
 async def eightball(interaction: discord.Interaction, question: str):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2137,7 +2137,7 @@ async def eightball(interaction: discord.Interaction, question: str):
     user="Optional user to mention"
 )
 async def tellmeajoke(interaction: discord.Interaction, context: Optional[str] = None, user: Optional[discord.User] = None):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2172,7 +2172,7 @@ async def tellmeajoke(interaction: discord.Interaction, context: Optional[str] =
 @bot.tree.command(name="askbloom", description="Ask Bloom anything")
 @app_commands.describe(question="Your question")
 async def askbloom(interaction: discord.Interaction, question: str):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2191,7 +2191,7 @@ async def askbloom(interaction: discord.Interaction, question: str):
     reason="Reason for the ban"
 )
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2217,7 +2217,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
 @bot.tree.command(name="roastchance", description="Set the legendary roast trigger chance percentage")
 @app_commands.describe(percentage="The percentage chance (0.0 to 100.0) for Bloom to roast")
 async def roastchance(interaction: discord.Interaction, percentage: float):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2240,7 +2240,7 @@ async def roastchance(interaction: discord.Interaction, percentage: float):
 
 @bot.tree.command(name="kbstats", description="Show knowledge base statistics")
 async def kbstats(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2281,7 +2281,7 @@ async def kbstats(interaction: discord.Interaction):
 
 @bot.tree.command(name="kbexport", description="Export knowledge base as JSON file")
 async def kbexport(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2322,7 +2322,7 @@ async def kbexport(interaction: discord.Interaction):
 
 @bot.tree.command(name="extractkb", description="Extract knowledge base as JSON file (alias of /kbexport)")
 async def extractkb(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2363,7 +2363,7 @@ async def extractkb(interaction: discord.Interaction):
 
 @bot.tree.command(name="downloadkb", description="Download all stored knowledge base Q&A as a file")
 async def downloadkb(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2400,7 +2400,7 @@ async def downloadkb(interaction: discord.Interaction):
     days_old="Remove entries older than X days (optional)"
 )
 async def kbpurge(interaction: discord.Interaction, entry_id: Optional[int] = None, days_old: Optional[int] = None):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2424,7 +2424,7 @@ async def kbpurge(interaction: discord.Interaction, entry_id: Optional[int] = No
 
 @bot.tree.command(name="kbreview", description="Review borderline quality knowledge base entries")
 async def kbreview(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2462,7 +2462,7 @@ async def kbreview(interaction: discord.Interaction):
     fuzzy_threshold="Fuzzy text similarity threshold 0.0-1.0 (default: 0.85)"
 )
 async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2527,7 +2527,7 @@ async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, seman
 
 @bot.tree.command(name="kbanalytics", description="Advanced knowledge base analytics and health metrics")
 async def kbanalytics(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2600,7 +2600,7 @@ async def kbanalytics(interaction: discord.Interaction):
 
 @bot.tree.command(name="deletekb", description="Delete ALL knowledge base entries (WARNING: Cannot be undone!)")
 async def deletekb(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2637,7 +2637,7 @@ async def deletekb(interaction: discord.Interaction):
 @bot.tree.command(name="store", description="Bulk import knowledge base entries from JSON")
 @app_commands.describe(json_data="JSON array of KB entries with question, answer, q_clear, a_substance fields")
 async def store(interaction: discord.Interaction, json_data: str):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2715,7 +2715,7 @@ async def store(interaction: discord.Interaction, json_data: str):
     color="Optional color (gray, red, pink, blue, green, yellow, purple, orange)"
 )
 async def saywb(interaction: discord.Interaction, description: str, title: Optional[str] = None, color: Optional[str] = None):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2748,7 +2748,7 @@ async def saywb(interaction: discord.Interaction, description: str, title: Optio
 
 @bot.tree.command(name="setup", description="Setup role selection message")
 async def setup(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -2945,7 +2945,7 @@ async def avatar(interaction: discord.Interaction, user: Optional[discord.Member
 
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
-    if str(interaction.user.id) != OWNER_ID:
+    if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
 
