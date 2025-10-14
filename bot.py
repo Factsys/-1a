@@ -1189,208 +1189,338 @@ def generate_embedding(text: str) -> Optional[List[float]]:
     return embedding
 
 def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = False) -> bool:
-    """Hybrid validation: rule-based first, AI only for edge cases."""
+    """ENHANCED RULE-BASED VALIDATION - NO AI - Multi-signal scoring with defensive error handling."""
     import re
     
-    # Rule 1: Check word overlap (fast)
-    word_overlap = answer_relevance_score(question, answer)
-    
-    # Rule 2: Check if answer is actually a question (reject)
-    answer_lower = answer.lower().strip()
-    question_indicators = sum(1 for w in ['what', 'why', 'how', 'when', 'where', 'who'] if w in answer_lower.split())
-    if question_indicators >= 2 or (question_indicators == 1 and '?' in answer):
-        print(f"🚫 Rule-based: Answer is a question, rejected | A: '{answer[:40]}...'")
+    # Defensive: Handle null/empty inputs
+    if not question or not answer:
+        print(f"🚫 Validation: Empty input rejected")
         return False
     
-    # Rule 3: Strong overlap = auto-approve (no AI needed)
-    if word_overlap >= 0.35:
-        print(f"✅ Rule-based: Strong word overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
-        return True
-    
-    # Rule 4: Very weak overlap = auto-reject (no AI needed)
-    if word_overlap < 0.15:
-        print(f"🚫 Rule-based: Weak word overlap ({word_overlap:.2f}), rejected | Q: '{question[:40]}...'")
-        return False
-    
-    # Rule 5: Check if answer has instructional content
-    instructional_verbs = {'use', 'click', 'go', 'check', 'try', 'enable', 'disable', 'set', 'turn', 'make', 'get'}
-    has_instructions = any(verb in answer_lower.split() for verb in instructional_verbs)
-    if has_instructions and word_overlap >= 0.20:
-        print(f"✅ Rule-based: Has instructions + decent overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
-        return True
-    
-    # Edge case (0.15-0.35 overlap, no instructions): Use AI only if enabled
-    if use_ai_fallback:
-        print(f"⚙️ Borderline case ({word_overlap:.2f}), using AI validation...")
-        validation_prompt = f"""Analyze if this answer actually addresses the question. Reply with ONLY 'yes' or 'no'.
-
-Question: {question}
-Answer: {answer}
-
-Are they related? (yes/no):"""
+    try:
+        question = str(question).strip()
+        answer = str(answer).strip()
         
-        try:
-            response = get_ai_response(validation_prompt, "You are a strict validator. Reply ONLY with 'yes' or 'no'.")
-            if response:
-                response_lower = response.strip().lower()
-                is_valid = 'yes' in response_lower[:10]
-                if not is_valid:
-                    print(f"🚫 AI rejected Q&A pair as unrelated | Q: '{question[:40]}...' | A: '{answer[:40]}...'")
-                return is_valid
-        except Exception as e:
-            print(f"⚠️ AI validation error: {e}, using rule-based fallback")
-    
-    # Fallback: moderate overlap = approve
-    result = word_overlap >= 0.20
-    print(f"{'✅' if result else '🚫'} Rule-based fallback: overlap {word_overlap:.2f}, {'approved' if result else 'rejected'}")
-    return result
+        if not question or not answer:
+            print(f"🚫 Validation: Blank text rejected")
+            return False
+        
+        # Rule 1: Check word overlap (lexical similarity)
+        word_overlap = answer_relevance_score(question, answer)
+        
+        # Rule 2: Structural validation - reject answers that are actually questions
+        answer_lower = answer.lower()
+        question_indicators = sum(1 for w in ['what', 'why', 'how', 'when', 'where', 'who'] if w in answer_lower.split())
+        if question_indicators >= 2 or (question_indicators == 1 and '?' in answer):
+            print(f"🚫 Structural: Answer is a question, rejected | A: '{answer[:40]}...'")
+            return False
+        
+        # Rule 3: Reject contradictory/negative answers
+        negative_patterns = [
+            r'\b(i don\'?t know|idk|no idea|not sure|dunno)\b',
+            r'\b(can\'?t help|sorry)\b',
+            r'\b(nobody knows|no one knows)\b'
+        ]
+        for pattern in negative_patterns:
+            if re.search(pattern, answer_lower):
+                print(f"🚫 Content: Negative/unhelpful answer rejected | A: '{answer[:40]}...'")
+                return False
+        
+        # Rule 4: Strong overlap = auto-approve
+        if word_overlap >= 0.35:
+            print(f"✅ Lexical: Strong word overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
+            return True
+        
+        # Rule 5: Very weak overlap = auto-reject
+        if word_overlap < 0.12:
+            print(f"🚫 Lexical: Weak word overlap ({word_overlap:.2f}), rejected | Q: '{question[:40]}...'")
+            return False
+        
+        # Rule 6: Check for instructional/actionable content
+        instructional_verbs = {'use', 'click', 'go', 'check', 'try', 'enable', 'disable', 'set', 'turn', 'make', 'get', 'open', 'close', 'press', 'type', 'run', 'install'}
+        answer_words = set(answer_lower.split())
+        has_instructions = bool(answer_words.intersection(instructional_verbs))
+        
+        # Rule 7: Check for explanatory content (because, since, when, if, etc.)
+        explanatory_words = {'because', 'since', 'when', 'if', 'then', 'thus', 'therefore', 'due', 'so'}
+        has_explanation = bool(answer_words.intersection(explanatory_words))
+        
+        # Rule 8: Check for numerical/technical content
+        has_numbers = bool(re.search(r'\d', answer))
+        has_technical = bool(re.search(r'[a-z]+\.[a-z]+|/|\-\-|\.exe|\.py|\.js', answer_lower))
+        
+        # Multi-signal scoring for borderline cases (0.12-0.35 overlap)
+        signal_score = 0
+        if has_instructions: signal_score += 2
+        if has_explanation: signal_score += 2
+        if has_numbers: signal_score += 1
+        if has_technical: signal_score += 1
+        if len(answer) > 30: signal_score += 1
+        
+        # Decision logic for borderline cases
+        if word_overlap >= 0.20:
+            if signal_score >= 2:
+                print(f"✅ Multi-signal: Moderate overlap ({word_overlap:.2f}) + signals ({signal_score}), approved | Q: '{question[:40]}...'")
+                return True
+            else:
+                print(f"🚫 Multi-signal: Moderate overlap ({word_overlap:.2f}) but weak signals ({signal_score}), rejected")
+                return False
+        else:  # 0.12-0.20 overlap range
+            if signal_score >= 3:
+                print(f"✅ Multi-signal: Low overlap ({word_overlap:.2f}) but strong signals ({signal_score}), approved | Q: '{question[:40]}...'")
+                return True
+            else:
+                print(f"🚫 Multi-signal: Low overlap ({word_overlap:.2f}) and weak signals ({signal_score}), rejected")
+                return False
+                
+    except Exception as e:
+        print(f"⚠️ Validation error: {e}, rejecting for safety")
+        return False
 
 def check_conversation_end(conversation_context: str, idle_seconds: float, use_ai_fallback: bool = True) -> bool:
-    """Hybrid conversation end detection: rule-based first, AI only for edge cases."""
+    """ENHANCED RULE-BASED CONVERSATION END DETECTION - NO AI - Temporal heuristics with pattern matching."""
     import re
     
-    lines = conversation_context.strip().split('\n')
-    
-    # Rule 1: Very short conversations (<=2 exchanges) + long idle = auto-end
-    if len(lines) <= 4 and idle_seconds >= 60:
-        print(f"✅ Rule-based: Short conversation ({len(lines)} lines) + {idle_seconds:.0f}s idle = ended")
-        return True
-    
-    # Rule 2: Long idle (90+ seconds) = auto-end (no AI needed)
-    if idle_seconds >= 90:
-        print(f"✅ Rule-based: Long idle ({idle_seconds:.0f}s) = conversation ended")
-        return True
-    
-    # Rule 3: Check for closing phrases (auto-end)
-    closing_phrases = ['thanks', 'thank you', 'ty', 'got it', 'ok cool', 'perfect', 'awesome', 'appreciate it']
-    last_messages = ' '.join(lines[-3:]).lower() if len(lines) >= 3 else conversation_context.lower()
-    has_closing = any(phrase in last_messages for phrase in closing_phrases)
-    if has_closing and idle_seconds >= 40:
-        print(f"✅ Rule-based: Closing phrase + {idle_seconds:.0f}s idle = ended")
-        return True
-    
-    # Rule 4: Recent activity (< 30 seconds idle) = NOT ended
-    if idle_seconds < 30:
-        print(f"🔄 Rule-based: Recent activity ({idle_seconds:.0f}s idle) = ongoing")
+    # Defensive: Handle null/empty inputs
+    if not conversation_context:
+        print(f"🔄 End check: Empty context, treating as ongoing")
         return False
     
-    # Edge case (30-90 seconds, no closing phrases): Use AI only if enabled
-    if use_ai_fallback and idle_seconds >= 45:
-        print(f"⚙️ Borderline case ({idle_seconds:.0f}s idle, {len(lines)} lines), using AI RouterBot...")
-        prompt = f"""Analyze this conversation and determine if it has ended. Reply with ONLY 'yes' or 'no'.
-
-Conversation:
-{conversation_context}
-
-Has the conversation naturally concluded? (yes/no):"""
+    try:
+        conversation_context = str(conversation_context).strip()
+        if not conversation_context:
+            print(f"🔄 End check: Blank context, treating as ongoing")
+            return False
         
-        try:
-            response = get_ai_response(prompt, "You are RouterBot, a conversation analyzer. Reply ONLY with 'yes' or 'no'.")
-            if response and not response.startswith("⚠️") and not response.startswith("❌"):
-                response_lower = response.strip().lower()
-                has_ended = 'yes' in response_lower[:10]
-                return has_ended
-        except Exception as e:
-            print(f"⚠️ RouterBot conversation end check error: {e}, using rule-based fallback")
-    
-    # Fallback: moderate idle = ended
-    result = idle_seconds >= 50
-    print(f"{'✅' if result else '🔄'} Rule-based fallback: {idle_seconds:.0f}s idle, conversation {'ended' if result else 'ongoing'}")
-    return result
+        lines = conversation_context.split('\n')
+        context_lower = conversation_context.lower()
+        
+        # Rule 1: Very short conversations + moderate idle = ended
+        if len(lines) <= 4 and idle_seconds >= 50:
+            print(f"✅ Temporal: Short conversation ({len(lines)} lines) + {idle_seconds:.0f}s idle = ended")
+            return True
+        
+        # Rule 2: Long idle = definite end
+        if idle_seconds >= 90:
+            print(f"✅ Temporal: Long idle ({idle_seconds:.0f}s) = conversation ended")
+            return True
+        
+        # Rule 3: Explicit closing patterns (strong signals)
+        closing_patterns = [
+            r'\b(thanks?|thank you|ty|thx|appreciate)\b',
+            r'\b(got it|understood|makes sense|i see)\b',
+            r'\b(perfect|awesome|great|cool|nice)\s*$',
+            r'\b(alright|okay|ok|kk)\s*$',
+            r'\b(bye|goodbye|see you|cya|later)\b'
+        ]
+        
+        # Check last 3 messages for closing patterns
+        last_messages = ' '.join(lines[-3:]) if len(lines) >= 3 else conversation_context
+        closing_count = sum(1 for pattern in closing_patterns if re.search(pattern, last_messages.lower()))
+        
+        if closing_count >= 2 and idle_seconds >= 30:
+            print(f"✅ Pattern: Multiple closing phrases ({closing_count}) + {idle_seconds:.0f}s idle = ended")
+            return True
+        
+        if closing_count >= 1 and idle_seconds >= 45:
+            print(f"✅ Pattern: Closing phrase + {idle_seconds:.0f}s idle = ended")
+            return True
+        
+        # Rule 4: Question-answer completion detection
+        if len(lines) >= 2:
+            last_line = lines[-1].lower()
+            # If last message is an answer (not a question) and idle > 40s
+            if '?' not in last_line and idle_seconds >= 40:
+                # Check if it's a substantive answer (has key indicators)
+                answer_indicators = ['use', 'try', 'check', 'enable', 'go', 'click', 'set']
+                if any(word in last_line for word in answer_indicators):
+                    print(f"✅ Pattern: Answer given + {idle_seconds:.0f}s idle = ended")
+                    return True
+        
+        # Rule 5: Recent activity = definitely ongoing
+        if idle_seconds < 25:
+            print(f"🔄 Temporal: Recent activity ({idle_seconds:.0f}s idle) = ongoing")
+            return False
+        
+        # Rule 6: Conversation length vs idle time heuristic
+        # Longer conversations need more idle time to end
+        conversation_length = len(lines)
+        if conversation_length <= 6:
+            idle_threshold = 45
+        elif conversation_length <= 12:
+            idle_threshold = 55
+        else:
+            idle_threshold = 65
+        
+        if idle_seconds >= idle_threshold:
+            print(f"✅ Heuristic: {conversation_length} lines + {idle_seconds:.0f}s idle (threshold: {idle_threshold}s) = ended")
+            return True
+        
+        # Rule 7: Check for unresolved questions (should stay open longer)
+        if '?' in last_messages and idle_seconds < 60:
+            print(f"🔄 Pattern: Unresolved question + {idle_seconds:.0f}s idle = ongoing")
+            return False
+        
+        # Default: moderate idle with no strong signals = ended
+        if idle_seconds >= 50:
+            print(f"✅ Default: Moderate idle ({idle_seconds:.0f}s) with no strong signals = ended")
+            return True
+        else:
+            print(f"🔄 Default: Not enough idle time ({idle_seconds:.0f}s) = ongoing")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ Conversation end check error: {e}, treating as ongoing for safety")
+        return False
 
 def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict], use_ai_fallback: bool = False) -> bool:
-    """Hybrid worthiness check: rule-based first, AI only for edge cases."""
+    """ENHANCED RULE-BASED WORTHINESS CHECK - NO AI - Comprehensive quality scoring with multi-factor analysis."""
     import re
     
+    # Defensive: Handle null/empty inputs
     if not qa_pairs:
-        print(f"🚫 Rule-based: No Q&A pairs, rejected")
+        print(f"🚫 Worthiness: No Q&A pairs, rejected")
         return False
     
-    # Rule 1: Single Q&A with good quality scores = auto-approve
-    if len(qa_pairs) == 1:
-        qa = qa_pairs[0]
-        q_len = len(qa['question'])
-        a_len = len(qa['answer'])
-        q_clear_est = calculate_q_clear(qa['question'])
-        a_substance_est = calculate_a_substance(qa['answer'])
+    try:
+        # Ensure conversation_context is safe to use
+        conversation_context = str(conversation_context or '').strip()
         
-        if q_clear_est >= 0.65 and a_substance_est >= 0.65 and q_len >= 10 and a_len >= 20:
-            print(f"✅ Rule-based: Single Q&A with high quality (Q={q_clear_est:.2f}, A={a_substance_est:.2f}), approved")
-            return True
+        # Rule 1: Calculate quality metrics for all Q&A pairs
+        quality_scores = []
+        for qa in qa_pairs:
+            try:
+                q_text = str(qa.get('question', '')).strip()
+                a_text = str(qa.get('answer', '')).strip()
+                
+                if not q_text or not a_text:
+                    continue
+                
+                q_clear = calculate_q_clear(q_text)
+                a_substance = calculate_a_substance(a_text)
+                quality_scores.append((q_clear, a_substance, q_text, a_text))
+            except Exception as e:
+                print(f"⚠️ Error processing Q&A pair: {e}")
+                continue
         
-        if q_clear_est < 0.50 or a_substance_est < 0.50:
-            print(f"🚫 Rule-based: Single Q&A with low quality (Q={q_clear_est:.2f}, A={a_substance_est:.2f}), rejected")
+        if not quality_scores:
+            print(f"🚫 Worthiness: No valid Q&A pairs after processing, rejected")
             return False
-    
-    # Rule 2: Multiple Q&A pairs = auto-approve (learning exchange)
-    if len(qa_pairs) >= 2:
-        avg_q_clear = sum(calculate_q_clear(qa['question']) for qa in qa_pairs) / len(qa_pairs)
-        avg_a_substance = sum(calculate_a_substance(qa['answer']) for qa in qa_pairs) / len(qa_pairs)
         
-        if avg_q_clear >= 0.55 and avg_a_substance >= 0.55:
-            print(f"✅ Rule-based: Multiple Q&A ({len(qa_pairs)} pairs) with decent quality, approved")
+        # Calculate averages
+        avg_q_clear = sum(q for q, a, _, _ in quality_scores) / len(quality_scores)
+        avg_a_substance = sum(a for q, a, _, _ in quality_scores) / len(quality_scores)
+        
+        # Rule 2: High-quality single Q&A = auto-approve
+        if len(quality_scores) == 1:
+            q_clear, a_substance, q_text, a_text = quality_scores[0]
+            if q_clear >= 0.65 and a_substance >= 0.65 and len(q_text) >= 10 and len(a_text) >= 20:
+                print(f"✅ Quality: Single high-quality Q&A (Q={q_clear:.2f}, A={a_substance:.2f}), approved")
+                return True
+            
+            if q_clear < 0.45 or a_substance < 0.45:
+                print(f"🚫 Quality: Single low-quality Q&A (Q={q_clear:.2f}, A={a_substance:.2f}), rejected")
+                return False
+        
+        # Rule 3: Multiple Q&A with good average quality = auto-approve
+        if len(quality_scores) >= 2:
+            if avg_q_clear >= 0.55 and avg_a_substance >= 0.55:
+                print(f"✅ Quality: Multiple Q&A ({len(quality_scores)} pairs, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), approved")
+                return True
+            
+            if avg_q_clear < 0.40 or avg_a_substance < 0.40:
+                print(f"🚫 Quality: Multiple low-quality Q&A ({len(quality_scores)} pairs, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), rejected")
+                return False
+        
+        # Rule 4: Casual chat detection (auto-reject)
+        if conversation_context:
+            context_lower = conversation_context.lower()
+            casual_phrases = ['lol', 'lmao', 'bruh', 'ngl', 'fr', 'tbh', 'omg', 'wtf', 'lmfao']
+            casual_count = sum(1 for phrase in casual_phrases if phrase in context_lower)
+            word_count = len(context_lower.split())
+            casual_ratio = casual_count / max(word_count, 1)
+            
+            if casual_ratio > 0.15:
+                print(f"🚫 Content: High casual chat ratio ({casual_ratio:.2f}), rejected")
+                return False
+        
+        # Rule 5: Content substance analysis
+        substance_signals = 0
+        for _, _, q_text, a_text in quality_scores:
+            a_lower = a_text.lower()
+            
+            # Check for instructional content
+            instructional_verbs = ['use', 'click', 'go', 'try', 'check', 'enable', 'disable', 'set', 'turn', 'make', 'get', 'open', 'close', 'press', 'run', 'install']
+            if any(verb in a_lower.split() for verb in instructional_verbs):
+                substance_signals += 2
+            
+            # Check for explanatory content
+            explanatory_words = ['because', 'since', 'when', 'if', 'then', 'thus', 'therefore', 'due', 'so', 'that\'s why']
+            if any(word in a_lower for word in explanatory_words):
+                substance_signals += 2
+            
+            # Check for technical/numerical content
+            if re.search(r'\d', a_text):
+                substance_signals += 1
+            
+            if re.search(r'[a-z]+\.[a-z]+|/|\-\-|\.exe|\.py|\.js|\.html|\.css', a_lower):
+                substance_signals += 1
+            
+            # Check for detailed answers
+            if len(a_text) > 40:
+                substance_signals += 1
+        
+        # Normalize substance score
+        max_signals = len(quality_scores) * 7  # Max possible signals per Q&A
+        substance_ratio = substance_signals / max(max_signals, 1)
+        
+        # Rule 6: Educational content indicators
+        educational_keywords = ['learn', 'tutorial', 'guide', 'how to', 'step', 'method', 'technique', 'solution', 'fix', 'setup', 'configure', 'install']
+        educational_count = 0
+        if conversation_context:
+            educational_count = sum(1 for keyword in educational_keywords if keyword in conversation_context.lower())
+        
+        # Rule 7: Multi-factor decision for borderline cases
+        decision_score = 0
+        
+        # Factor 1: Quality scores (0-3 points)
+        if avg_q_clear >= 0.60 and avg_a_substance >= 0.60:
+            decision_score += 3
+        elif avg_q_clear >= 0.50 and avg_a_substance >= 0.50:
+            decision_score += 2
+        elif avg_q_clear >= 0.45 and avg_a_substance >= 0.45:
+            decision_score += 1
+        
+        # Factor 2: Substance signals (0-2 points)
+        if substance_ratio >= 0.30:
+            decision_score += 2
+        elif substance_ratio >= 0.20:
+            decision_score += 1
+        
+        # Factor 3: Educational indicators (0-2 points)
+        if educational_count >= 3:
+            decision_score += 2
+        elif educational_count >= 1:
+            decision_score += 1
+        
+        # Factor 4: Multiple Q&A bonus (0-1 point)
+        if len(quality_scores) >= 2:
+            decision_score += 1
+        
+        # Decision threshold
+        if decision_score >= 5:
+            print(f"✅ Multi-factor: High decision score ({decision_score}/8, substance={substance_ratio:.2f}, educational={educational_count}), approved")
             return True
-    
-    # Rule 3: Check for casual chat patterns (auto-reject)
-    all_text = conversation_context.lower()
-    casual_ratio = sum(1 for phrase in ['lol', 'lmao', 'bruh', 'ngl', 'fr', 'tbh'] if phrase in all_text) / max(len(all_text.split()), 1)
-    if casual_ratio > 0.15:
-        print(f"🚫 Rule-based: High casual chat ratio ({casual_ratio:.2f}), rejected")
+        elif decision_score >= 3:
+            print(f"✅ Multi-factor: Moderate decision score ({decision_score}/8, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), approved")
+            return True
+        else:
+            print(f"🚫 Multi-factor: Low decision score ({decision_score}/8, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), rejected")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ Worthiness check error: {e}, rejecting for safety")
         return False
-    
-    # Rule 4: Check if answers have substance (instruction verbs, numbers, details)
-    has_substance = False
-    for qa in qa_pairs:
-        answer_lower = qa['answer'].lower()
-        has_instructions = any(verb in answer_lower.split() for verb in ['use', 'click', 'go', 'try', 'check', 'enable', 'set'])
-        has_numbers = bool(re.search(r'\d', qa['answer']))
-        if has_instructions or has_numbers or len(qa['answer']) > 40:
-            has_substance = True
-            break
-    
-    if has_substance:
-        print(f"✅ Rule-based: Answers have substance (instructions/numbers/length), approved")
-        return True
-    
-    # Edge case (borderline quality, no clear signals): Use AI only if enabled
-    if use_ai_fallback and len(qa_pairs) >= 1:
-        print(f"⚙️ Borderline case ({len(qa_pairs)} Q&A pairs), using AI RouterBot...")
-        qa_summary = "\n".join([f"Q: {qa['question']}\nA: {qa['answer']}\n" for qa in qa_pairs])
-        
-        prompt = f"""You are RouterBot, an AI that determines if Q&A content is educational and worthy of storage.
-
-Conversation context:
-{conversation_context}
-
-Q&A pairs extracted:
-{qa_summary}
-
-Is this content educational and worthy to store in a knowledge base? Consider:
-- Is it a genuine learning exchange (not just casual chat)?
-- Does it contain useful information?
-- Is it clear and understandable?
-
-Reply with ONLY 'yes' or 'no'."""
-        
-        try:
-            response = get_ai_response(prompt, "You are RouterBot, a knowledge base curator. Reply ONLY with 'yes' or 'no'.")
-            if response and not response.startswith("⚠️") and not response.startswith("❌"):
-                response_lower = response.strip().lower()
-                is_worthy = 'yes' in response_lower[:10]
-                if is_worthy:
-                    print(f"✅ RouterBot APPROVED conversation for storage | {len(qa_pairs)} Q&A pairs")
-                else:
-                    print(f"🚫 RouterBot REJECTED conversation | Reason: Not educational/worthy")
-                return is_worthy
-        except Exception as e:
-            print(f"⚠️ RouterBot validation exception: {e}, using rule-based fallback")
-    
-    # Fallback: if we got here, likely borderline - approve if has basic quality
-    avg_q_clear = sum(calculate_q_clear(qa['question']) for qa in qa_pairs) / len(qa_pairs)
-    avg_a_substance = sum(calculate_a_substance(qa['answer']) for qa in qa_pairs) / len(qa_pairs)
-    result = avg_q_clear >= 0.50 and avg_a_substance >= 0.50
-    print(f"{'✅' if result else '🚫'} Rule-based fallback: Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}, {'approved' if result else 'rejected'}")
-    return result
 
 def process_pending_conversation(user_id: str, conversation_data: Dict):
     """Process a pending conversation with AI RouterBot validation - supports single and multiple Q&A pairs."""
@@ -1530,7 +1660,7 @@ async def process_expired_conversations():
                             del pending_conversations[user_id]
                             continue
 
-                        # 45-second idle check with AI RouterBot validation for complex conversations
+                        # 45-second idle check with rule-based validation for complex conversations
                         if time_since_last >= 45 and q_count >= 1 and ans_count >= 1:
                             conversation_parts = []
                             for q in conv_data['questions'][-5:]:
@@ -1541,8 +1671,8 @@ async def process_expired_conversations():
                             recent_context = "\n".join(conversation_parts)
                             
                             if len(recent_context) > 50:
-                                # Store context for AI check outside lock
-                                expired_users.append((user_id, conv_data, recent_context, True))
+                                # Store context AND idle time for rule-based check outside lock (thread-safe)
+                                expired_users.append((user_id, conv_data, recent_context, time_since_last))
                                 continue
                         
                         # 5-minute max window BUT ONLY if also idle for 30+ seconds (prevents cutting active conversations)
@@ -1551,25 +1681,25 @@ async def process_expired_conversations():
                             expired_users.append((user_id, conv_data, None, False))
                             del pending_conversations[user_id]
 
-            # Process conversations with AI RouterBot validation (released from lock)
+            # Process conversations with enhanced rule-based validation (released from lock)
             for item in expired_users:
-                if len(item) == 4:  # AI validation needed
-                    user_id, conv_data, context, needs_ai_check = item
+                if len(item) == 4:  # Rule-based validation needed
+                    user_id, conv_data, context, idle_time = item
                     try:
-                        # Hybrid check (AI fallback enabled for edge cases only)
-                        conv_ended = await asyncio.to_thread(check_conversation_end, context, time_since_last, use_ai_fallback=True)
+                        # Enhanced rule-based check (NO AI) - idle_time was captured in lock
+                        conv_ended = await asyncio.to_thread(check_conversation_end, context, idle_time, use_ai_fallback=False)
                         
                         if conv_ended:
-                            print(f"🎯 AI RouterBot: Conversation ended for {user_id} (45s idle) - Processing...")
+                            print(f"🎯 Validation: Conversation ended for {user_id} (45s idle) - Processing...")
                             with conversation_lock:
                                 pending_conversations.pop(user_id, None)
                                 if user_id in last_end_check_time:
                                     del last_end_check_time[user_id]
                             await asyncio.to_thread(process_pending_conversation, user_id, conv_data)
                         else:
-                            print(f"⏳ AI RouterBot: Conversation ongoing for {user_id} - Waiting...")
+                            print(f"⏳ Validation: Conversation ongoing for {user_id} - Waiting...")
                     except Exception as e:
-                        print(f"⚠️ AI RouterBot validation error for {user_id}: {e}")
+                        print(f"⚠️ Validation error for {user_id}: {e}")
                 else:  # Force process or fast-track
                     user_id, conv_data, _, _ = item
                     print(f"⏰ Force processing {user_id} (5-min max window or fast-track)")
@@ -1658,6 +1788,14 @@ intents.guild_messages = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Suppress CommandNotFound errors to reduce console noise"""
+    if isinstance(error, commands.CommandNotFound):
+        pass  # Silently ignore - users trying wrong commands
+    else:
+        print(f"Command error: {error}")
 
 @bot.event
 async def on_ready():
