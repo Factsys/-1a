@@ -124,53 +124,53 @@ def detect_pii(text: str) -> bool:
 def is_actually_a_question(text: str) -> bool:
     """Check if text is actually a question and not instructions or statements."""
     import re
-    
+
     text_lower = text.lower().strip()
     words = re.findall(r'\b\w+\b', text_lower)
-    
+
     instruction_starts = [
         r'^\d+\.',
         r'^(first|second|third|then|next|finally|step)',
     ]
-    
+
     for pattern in instruction_starts:
         if re.match(pattern, text_lower):
             return False
-    
+
     numbered_steps = re.findall(r'\d+\.', text)
     if len(numbered_steps) >= 2:
         return False
-    
+
     question_words = {'how', 'what', 'why', 'when', 'where', 'who', 'which', 'can', 'is', 'are', 'do', 'does', 'will', 'would', 'should', 'could', 'any', 'need'}
     has_question_word = any(word in words for word in question_words)
-    
+
     has_question_mark = '?' in text
-    
+
     if has_question_mark or has_question_word:
         return True
-    
+
     if len(words) < 2:
         return False
-    
+
     return False
 
 def answer_relevance_score(question: str, answer: str) -> float:
     """Calculate how relevant an answer is to its question based on word overlap."""
     import re
-    
+
     question_words = set(re.findall(r'\b\w{3,}\b', question.lower()))
     answer_words = set(re.findall(r'\b\w{3,}\b', answer.lower()))
-    
+
     stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'this', 'that', 'with', 'from'}
     question_words = question_words - stop_words
     answer_words = answer_words - stop_words
-    
+
     if not question_words:
         return 0.0
-    
+
     overlap = question_words.intersection(answer_words)
     relevance = len(overlap) / len(question_words)
-    
+
     return relevance
 
 def calculate_q_clear(question: str) -> float:
@@ -184,7 +184,7 @@ def calculate_q_clear(question: str) -> float:
     words = re.findall(r'\b\w+\b', question.lower())
     if not words:
         return 0.0
-    
+
     if not is_actually_a_question(question):
         return 0.0
 
@@ -198,11 +198,11 @@ def calculate_q_clear(question: str) -> float:
     punctuation_score = 1.0 if has_punctuation else 0.6
 
     q_clear = 0.4 * length_score + 0.4 * question_word_score + 0.2 * punctuation_score
-    
+
     # Require minimum 5 words for good clarity
     if len(words) < 5:
         q_clear *= 0.8
-    
+
     return min(q_clear, 1.0)
 
 def calculate_a_substance(answer: str) -> float:
@@ -222,7 +222,7 @@ def calculate_a_substance(answer: str) -> float:
     question_count = sum(1 for word in words if word in question_words)
     if question_count >= 2 or (question_count == 1 and '?' in answer):
         return 0.0  # This is a question, not an answer
-    
+
     # Reject vague affirmations
     vague_patterns = [
         r'^(yes|no|yeah|nah|yep|nope)\s+(there\s+is|it\s+is|i\s+think)',
@@ -234,7 +234,7 @@ def calculate_a_substance(answer: str) -> float:
             return 0.0
 
     length_score = min(len(words) / 15.0, 1.0)
-    
+
     # Penalize very short answers heavily
     if len(words) < 5:
         length_score *= 0.5
@@ -245,9 +245,9 @@ def calculate_a_substance(answer: str) -> float:
 
     instructional_verbs = {'press', 'click', 'use', 'try', 'check', 'make', 'set', 'turn', 'cook', 'spam', 'enable', 'disable', 'get', 'need', 'go', 'open'}
     has_instructional = any(verb in words for verb in instructional_verbs)
-    
+
     has_details = len(words) > 8 and (bool(re.search(r'\d', answer)) or any(w in words for w in ['because', 'since', 'therefore', 'thus', 'due', 'when', 'after', 'before']))
-    
+
     detail_score = 1.0 if has_details else (0.7 if has_instructional and len(words) >= 8 else 0.4)
 
     a_substance = 0.4 * length_score + 0.3 * filler_penalty + 0.3 * detail_score
@@ -332,7 +332,7 @@ def is_teaching_content(text: str) -> bool:
         r'^(yeah|yep|nah|nope|idk|same|lol|lmao|bruh|fr|ngl|tbh)\b',
         r'^(thanks|thank you|ty|thx|ok|okay|cool|nice)\s*$',
     ]
-    
+
     for pattern in casual_response_patterns:
         if re.search(pattern, text_lower):
             return False
@@ -342,7 +342,7 @@ def is_teaching_content(text: str) -> bool:
         'idk', 'no idea', 'not sure', 'maybe', 'i think', 'probably',
         'same here', 'me too', 'same problem', 'same issue'
     }
-    
+
     for phrase in negative_phrases:
         if phrase in text_lower and len(words) < 15:
             return False
@@ -386,7 +386,7 @@ class Database:
             db_url = db_url[6:]
         elif db_url.startswith("psql "):
             db_url = db_url[5:]
-        
+
         db_url = db_url.strip()
         if db_url.endswith("'") or db_url.endswith('"'):
             db_url = db_url[:-1]
@@ -501,20 +501,20 @@ class Database:
     def fuzzy_text_similarity(self, text1: str, text2: str) -> float:
         """Calculate fuzzy text similarity using difflib."""
         return difflib.SequenceMatcher(None, text1.lower().strip(), text2.lower().strip()).ratio()
-    
+
     def enhanced_duplicate_check(self, question: str, answer: str, embedding: List[float], 
                                  semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85) -> Optional[Dict]:
         """Enhanced duplicate detection using both semantic and fuzzy text matching."""
         knowledge = self.get_all_knowledge()
-        
+
         for item in knowledge:
             stored_embedding = json.loads(item['embedding'])
             semantic_sim = self.cosine_similarity(embedding, stored_embedding)
-            
+
             if semantic_sim >= semantic_threshold:
                 fuzzy_q_sim = self.fuzzy_text_similarity(question, item['question'])
                 fuzzy_a_sim = self.fuzzy_text_similarity(answer, item['answer'])
-                
+
                 if fuzzy_q_sim >= fuzzy_threshold or (semantic_sim >= 0.92 and fuzzy_q_sim >= 0.75):
                     return {
                         **item,
@@ -523,10 +523,10 @@ class Database:
                         'fuzzy_a_similarity': fuzzy_a_sim,
                         'match_type': 'semantic+fuzzy'
                     }
-        
+
         for item in knowledge:
             fuzzy_q_sim = self.fuzzy_text_similarity(question, item['question'])
-            
+
             if fuzzy_q_sim >= 0.90:
                 return {
                     **item,
@@ -535,7 +535,7 @@ class Database:
                     'fuzzy_a_similarity': 0.0,
                     'match_type': 'fuzzy_only'
                 }
-        
+
         return None
 
     def save_knowledge(self, question: str, answer: str, embedding: List[float]) -> bool:
@@ -900,31 +900,31 @@ class Database:
                 return result[0] if result else None
         finally:
             self.put_connection(conn)
-    
+
     def find_all_duplicates(self, semantic_threshold: float = 0.88, fuzzy_threshold: float = 0.85) -> List[Dict]:
         """Find all duplicate pairs in the knowledge base."""
         knowledge = self.get_all_knowledge()
         duplicates = []
         processed_pairs = set()
-        
+
         for i, item1 in enumerate(knowledge):
             for j, item2 in enumerate(knowledge):
                 if i >= j:
                     continue
-                
+
                 pair_key = tuple(sorted([item1['id'], item2['id']]))
                 if pair_key in processed_pairs:
                     continue
-                
+
                 emb1 = json.loads(item1['embedding'])
                 emb2 = json.loads(item2['embedding'])
                 semantic_sim = self.cosine_similarity(emb1, emb2)
                 fuzzy_q_sim = self.fuzzy_text_similarity(item1['question'], item2['question'])
                 fuzzy_a_sim = self.fuzzy_text_similarity(item1['answer'], item2['answer'])
-                
+
                 is_duplicate = False
                 match_type = None
-                
+
                 if semantic_sim >= semantic_threshold and fuzzy_q_sim >= fuzzy_threshold:
                     is_duplicate = True
                     match_type = 'semantic+fuzzy'
@@ -934,7 +934,7 @@ class Database:
                 elif semantic_sim >= 0.92 and fuzzy_q_sim >= 0.75:
                     is_duplicate = True
                     match_type = 'high_semantic'
-                
+
                 if is_duplicate:
                     duplicates.append({
                         'id1': item1['id'],
@@ -955,9 +955,9 @@ class Database:
                         'a_substance2': item2.get('a_substance', 0)
                     })
                     processed_pairs.add(pair_key)
-        
+
         return duplicates
-    
+
     def remove_duplicate_entry(self, entry_id: int) -> bool:
         """Remove a specific duplicate entry."""
         conn = self.get_connection()
@@ -968,7 +968,7 @@ class Database:
                 return cur.rowcount > 0
         finally:
             self.put_connection(conn)
-    
+
     def export_knowledge_as_file(self) -> tuple[str, int]:
         """Export knowledge as formatted JSON string with entry count."""
         conn = self.get_connection()
@@ -1191,30 +1191,30 @@ def generate_embedding(text: str) -> Optional[List[float]]:
 def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = False) -> bool:
     """ENHANCED RULE-BASED VALIDATION - NO AI - Multi-signal scoring with defensive error handling."""
     import re
-    
+
     # Defensive: Handle null/empty inputs
     if not question or not answer:
         print(f"🚫 Validation: Empty input rejected")
         return False
-    
+
     try:
         question = str(question).strip()
         answer = str(answer).strip()
-        
+
         if not question or not answer:
             print(f"🚫 Validation: Blank text rejected")
             return False
-        
+
         # Rule 1: Check word overlap (lexical similarity)
         word_overlap = answer_relevance_score(question, answer)
-        
+
         # Rule 2: Structural validation - reject answers that are actually questions
         answer_lower = answer.lower()
         question_indicators = sum(1 for w in ['what', 'why', 'how', 'when', 'where', 'who'] if w in answer_lower.split())
         if question_indicators >= 2 or (question_indicators == 1 and '?' in answer):
             print(f"🚫 Structural: Answer is a question, rejected | A: '{answer[:40]}...'")
             return False
-        
+
         # Rule 3: Reject contradictory/negative answers
         negative_patterns = [
             r'\b(i don\'?t know|idk|no idea|not sure|dunno)\b',
@@ -1225,30 +1225,30 @@ def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = Fa
             if re.search(pattern, answer_lower):
                 print(f"🚫 Content: Negative/unhelpful answer rejected | A: '{answer[:40]}...'")
                 return False
-        
+
         # Rule 4: Strong overlap = auto-approve
         if word_overlap >= 0.35:
             print(f"✅ Lexical: Strong word overlap ({word_overlap:.2f}), approved | Q: '{question[:40]}...'")
             return True
-        
+
         # Rule 5: Very weak overlap = auto-reject
         if word_overlap < 0.12:
             print(f"🚫 Lexical: Weak word overlap ({word_overlap:.2f}), rejected | Q: '{question[:40]}...'")
             return False
-        
+
         # Rule 6: Check for instructional/actionable content
         instructional_verbs = {'use', 'click', 'go', 'check', 'try', 'enable', 'disable', 'set', 'turn', 'make', 'get', 'open', 'close', 'press', 'type', 'run', 'install'}
         answer_words = set(answer_lower.split())
         has_instructions = bool(answer_words.intersection(instructional_verbs))
-        
+
         # Rule 7: Check for explanatory content (because, since, when, if, etc.)
         explanatory_words = {'because', 'since', 'when', 'if', 'then', 'thus', 'therefore', 'due', 'so'}
         has_explanation = bool(answer_words.intersection(explanatory_words))
-        
+
         # Rule 8: Check for numerical/technical content
         has_numbers = bool(re.search(r'\d', answer))
         has_technical = bool(re.search(r'[a-z]+\.[a-z]+|/|\-\-|\.exe|\.py|\.js', answer_lower))
-        
+
         # Multi-signal scoring for borderline cases (0.12-0.35 overlap)
         signal_score = 0
         if has_instructions: signal_score += 2
@@ -1256,7 +1256,7 @@ def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = Fa
         if has_numbers: signal_score += 1
         if has_technical: signal_score += 1
         if len(answer) > 30: signal_score += 1
-        
+
         # Decision logic for borderline cases
         if word_overlap >= 0.20:
             if signal_score >= 2:
@@ -1272,7 +1272,7 @@ def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = Fa
             else:
                 print(f"🚫 Multi-signal: Low overlap ({word_overlap:.2f}) and weak signals ({signal_score}), rejected")
                 return False
-                
+
     except Exception as e:
         print(f"⚠️ Validation error: {e}, rejecting for safety")
         return False
@@ -1280,31 +1280,31 @@ def validate_qa_relevance(question: str, answer: str, use_ai_fallback: bool = Fa
 def check_conversation_end(conversation_context: str, idle_seconds: float, use_ai_fallback: bool = True) -> bool:
     """ENHANCED RULE-BASED CONVERSATION END DETECTION - NO AI - Temporal heuristics with pattern matching."""
     import re
-    
+
     # Defensive: Handle null/empty inputs
     if not conversation_context:
         print(f"🔄 End check: Empty context, treating as ongoing")
         return False
-    
+
     try:
         conversation_context = str(conversation_context).strip()
         if not conversation_context:
             print(f"🔄 End check: Blank context, treating as ongoing")
             return False
-        
+
         lines = conversation_context.split('\n')
         context_lower = conversation_context.lower()
-        
+
         # Rule 1: Very short conversations + moderate idle = ended
         if len(lines) <= 4 and idle_seconds >= 50:
             print(f"✅ Temporal: Short conversation ({len(lines)} lines) + {idle_seconds:.0f}s idle = ended")
             return True
-        
+
         # Rule 2: Long idle = definite end
         if idle_seconds >= 90:
             print(f"✅ Temporal: Long idle ({idle_seconds:.0f}s) = conversation ended")
             return True
-        
+
         # Rule 3: Explicit closing patterns (strong signals)
         closing_patterns = [
             r'\b(thanks?|thank you|ty|thx|appreciate)\b',
@@ -1313,19 +1313,19 @@ def check_conversation_end(conversation_context: str, idle_seconds: float, use_a
             r'\b(alright|okay|ok|kk)\s*$',
             r'\b(bye|goodbye|see you|cya|later)\b'
         ]
-        
+
         # Check last 3 messages for closing patterns
         last_messages = ' '.join(lines[-3:]) if len(lines) >= 3 else conversation_context
         closing_count = sum(1 for pattern in closing_patterns if re.search(pattern, last_messages.lower()))
-        
+
         if closing_count >= 2 and idle_seconds >= 30:
             print(f"✅ Pattern: Multiple closing phrases ({closing_count}) + {idle_seconds:.0f}s idle = ended")
             return True
-        
+
         if closing_count >= 1 and idle_seconds >= 45:
             print(f"✅ Pattern: Closing phrase + {idle_seconds:.0f}s idle = ended")
             return True
-        
+
         # Rule 4: Question-answer completion detection
         if len(lines) >= 2:
             last_line = lines[-1].lower()
@@ -1336,12 +1336,12 @@ def check_conversation_end(conversation_context: str, idle_seconds: float, use_a
                 if any(word in last_line for word in answer_indicators):
                     print(f"✅ Pattern: Answer given + {idle_seconds:.0f}s idle = ended")
                     return True
-        
+
         # Rule 5: Recent activity = definitely ongoing
         if idle_seconds < 25:
             print(f"🔄 Temporal: Recent activity ({idle_seconds:.0f}s idle) = ongoing")
             return False
-        
+
         # Rule 6: Conversation length vs idle time heuristic
         # Longer conversations need more idle time to end
         conversation_length = len(lines)
@@ -1351,16 +1351,16 @@ def check_conversation_end(conversation_context: str, idle_seconds: float, use_a
             idle_threshold = 55
         else:
             idle_threshold = 65
-        
+
         if idle_seconds >= idle_threshold:
             print(f"✅ Heuristic: {conversation_length} lines + {idle_seconds:.0f}s idle (threshold: {idle_threshold}s) = ended")
             return True
-        
+
         # Rule 7: Check for unresolved questions (should stay open longer)
         if '?' in last_messages and idle_seconds < 60:
             print(f"🔄 Pattern: Unresolved question + {idle_seconds:.0f}s idle = ongoing")
             return False
-        
+
         # Default: moderate idle with no strong signals = ended
         if idle_seconds >= 50:
             print(f"✅ Default: Moderate idle ({idle_seconds:.0f}s) with no strong signals = ended")
@@ -1368,7 +1368,7 @@ def check_conversation_end(conversation_context: str, idle_seconds: float, use_a
         else:
             print(f"🔄 Default: Not enough idle time ({idle_seconds:.0f}s) = ongoing")
             return False
-            
+
     except Exception as e:
         print(f"⚠️ Conversation end check error: {e}, treating as ongoing for safety")
         return False
@@ -1376,62 +1376,62 @@ def check_conversation_end(conversation_context: str, idle_seconds: float, use_a
 def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict], use_ai_fallback: bool = False) -> bool:
     """ENHANCED RULE-BASED WORTHINESS CHECK - NO AI - Comprehensive quality scoring with multi-factor analysis."""
     import re
-    
+
     # Defensive: Handle null/empty inputs
     if not qa_pairs:
         print(f"🚫 Worthiness: No Q&A pairs, rejected")
         return False
-    
+
     try:
         # Ensure conversation_context is safe to use
         conversation_context = str(conversation_context or '').strip()
-        
+
         # Rule 1: Calculate quality metrics for all Q&A pairs
         quality_scores = []
         for qa in qa_pairs:
             try:
                 q_text = str(qa.get('question', '')).strip()
                 a_text = str(qa.get('answer', '')).strip()
-                
+
                 if not q_text or not a_text:
                     continue
-                
+
                 q_clear = calculate_q_clear(q_text)
                 a_substance = calculate_a_substance(a_text)
                 quality_scores.append((q_clear, a_substance, q_text, a_text))
             except Exception as e:
                 print(f"⚠️ Error processing Q&A pair: {e}")
                 continue
-        
+
         if not quality_scores:
             print(f"🚫 Worthiness: No valid Q&A pairs after processing, rejected")
             return False
-        
+
         # Calculate averages
         avg_q_clear = sum(q for q, a, _, _ in quality_scores) / len(quality_scores)
         avg_a_substance = sum(a for q, a, _, _ in quality_scores) / len(quality_scores)
-        
+
         # Rule 2: High-quality single Q&A = auto-approve
         if len(quality_scores) == 1:
             q_clear, a_substance, q_text, a_text = quality_scores[0]
             if q_clear >= 0.65 and a_substance >= 0.65 and len(q_text) >= 10 and len(a_text) >= 20:
                 print(f"✅ Quality: Single high-quality Q&A (Q={q_clear:.2f}, A={a_substance:.2f}), approved")
                 return True
-            
+
             if q_clear < 0.45 or a_substance < 0.45:
                 print(f"🚫 Quality: Single low-quality Q&A (Q={q_clear:.2f}, A={a_substance:.2f}), rejected")
                 return False
-        
+
         # Rule 3: Multiple Q&A with good average quality = auto-approve
         if len(quality_scores) >= 2:
             if avg_q_clear >= 0.55 and avg_a_substance >= 0.55:
                 print(f"✅ Quality: Multiple Q&A ({len(quality_scores)} pairs, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), approved")
                 return True
-            
+
             if avg_q_clear < 0.40 or avg_a_substance < 0.40:
                 print(f"🚫 Quality: Multiple low-quality Q&A ({len(quality_scores)} pairs, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), rejected")
                 return False
-        
+
         # Rule 4: Casual chat detection (auto-reject)
         if conversation_context:
             context_lower = conversation_context.lower()
@@ -1439,50 +1439,50 @@ def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict
             casual_count = sum(1 for phrase in casual_phrases if phrase in context_lower)
             word_count = len(context_lower.split())
             casual_ratio = casual_count / max(word_count, 1)
-            
+
             if casual_ratio > 0.15:
                 print(f"🚫 Content: High casual chat ratio ({casual_ratio:.2f}), rejected")
                 return False
-        
+
         # Rule 5: Content substance analysis
         substance_signals = 0
         for _, _, q_text, a_text in quality_scores:
             a_lower = a_text.lower()
-            
+
             # Check for instructional content
             instructional_verbs = ['use', 'click', 'go', 'try', 'check', 'enable', 'disable', 'set', 'turn', 'make', 'get', 'open', 'close', 'press', 'run', 'install']
             if any(verb in a_lower.split() for verb in instructional_verbs):
                 substance_signals += 2
-            
+
             # Check for explanatory content
             explanatory_words = ['because', 'since', 'when', 'if', 'then', 'thus', 'therefore', 'due', 'so', 'that\'s why']
             if any(word in a_lower for word in explanatory_words):
                 substance_signals += 2
-            
+
             # Check for technical/numerical content
             if re.search(r'\d', a_text):
                 substance_signals += 1
-            
+
             if re.search(r'[a-z]+\.[a-z]+|/|\-\-|\.exe|\.py|\.js|\.html|\.css', a_lower):
                 substance_signals += 1
-            
+
             # Check for detailed answers
             if len(a_text) > 40:
                 substance_signals += 1
-        
+
         # Normalize substance score
         max_signals = len(quality_scores) * 7  # Max possible signals per Q&A
         substance_ratio = substance_signals / max(max_signals, 1)
-        
+
         # Rule 6: Educational content indicators
         educational_keywords = ['learn', 'tutorial', 'guide', 'how to', 'step', 'method', 'technique', 'solution', 'fix', 'setup', 'configure', 'install']
         educational_count = 0
         if conversation_context:
             educational_count = sum(1 for keyword in educational_keywords if keyword in conversation_context.lower())
-        
+
         # Rule 7: Multi-factor decision for borderline cases
         decision_score = 0
-        
+
         # Factor 1: Quality scores (0-3 points)
         if avg_q_clear >= 0.60 and avg_a_substance >= 0.60:
             decision_score += 3
@@ -1490,23 +1490,23 @@ def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict
             decision_score += 2
         elif avg_q_clear >= 0.45 and avg_a_substance >= 0.45:
             decision_score += 1
-        
+
         # Factor 2: Substance signals (0-2 points)
         if substance_ratio >= 0.30:
             decision_score += 2
         elif substance_ratio >= 0.20:
             decision_score += 1
-        
+
         # Factor 3: Educational indicators (0-2 points)
         if educational_count >= 3:
             decision_score += 2
         elif educational_count >= 1:
             decision_score += 1
-        
+
         # Factor 4: Multiple Q&A bonus (0-1 point)
         if len(quality_scores) >= 2:
             decision_score += 1
-        
+
         # Decision threshold
         if decision_score >= 5:
             print(f"✅ Multi-factor: High decision score ({decision_score}/8, substance={substance_ratio:.2f}, educational={educational_count}), approved")
@@ -1517,7 +1517,7 @@ def check_conversation_worthiness(conversation_context: str, qa_pairs: List[Dict
         else:
             print(f"🚫 Multi-factor: Low decision score ({decision_score}/8, Q={avg_q_clear:.2f}, A={avg_a_substance:.2f}), rejected")
             return False
-            
+
     except Exception as e:
         print(f"⚠️ Worthiness check error: {e}, rejecting for safety")
         return False
@@ -1545,7 +1545,7 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
             if is_greeting_or_casual(question_text) or is_blabberish(question_text):
                 print(f"⚠️ Skipping question '{question_text[:30]}...': greeting/casual/blabberish")
                 continue
-            
+
             if not is_actually_a_question(question_text):
                 print(f"⚠️ Skipping '{question_text[:30]}...': Not a question (likely instructions/steps)")
                 continue
@@ -1560,7 +1560,7 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
                 continue
 
             teaching_answers = [ans for ans in related_answers if is_teaching_content(ans['text'])]
-            
+
             if not teaching_answers:
                 print(f"⚠️ Skipping question '{question_text[:30]}...': No teaching answers")
                 continue
@@ -1586,10 +1586,10 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
             return
 
         conversation_context = "\n".join(conversation_context_parts)
-        
+
         # Use hybrid validation (AI fallback disabled by default to reduce API calls by 70%+)
         is_worthy = check_conversation_worthiness(conversation_context, qa_pairs, use_ai_fallback=False)
-        
+
         if not is_worthy:
             print(f"🚫 RouterBot rejected conversation for user {user_id}: Not worthy to store")
             return
@@ -1614,7 +1614,7 @@ def process_pending_conversation(user_id: str, conversation_data: Dict):
             q_clear_check = calculate_q_clear(question_text)
             a_substance_check = calculate_a_substance(aggregated_answer)
             print(f"🔍 Check | Student: {question_text[:60]}... | Teacher: {aggregated_answer[:60]}... | Q_Clear: {q_clear_check:.2f} | A_Substance: {a_substance_check:.2f}")
-            
+
             saved = db.save_knowledge(question_text, aggregated_answer, embedding)
             if saved:
                 helper_names = ', '.join(set(ans['author'] for ans in qa_pair['helpers']))
@@ -1645,7 +1645,7 @@ async def process_expired_conversations():
                 for user_id, conv_data in list(pending_conversations.items()):
                     last_message_time = conv_data.get('last_update')
                     first_message_time = conv_data.get('first_message')
-                    
+
                     if last_message_time:
                         time_since_last = (current_time - last_message_time).total_seconds()
                         time_since_first = (current_time - first_message_time).total_seconds() if first_message_time else 0
@@ -1667,14 +1667,14 @@ async def process_expired_conversations():
                                 conversation_parts.append(f"Student: {q['text']}")
                             for a in conv_data['answers'][-5:]:
                                 conversation_parts.append(f"Teacher: {a['text']}")
-                            
+
                             recent_context = "\n".join(conversation_parts)
-                            
+
                             if len(recent_context) > 50:
                                 # Store context AND idle time for rule-based check outside lock (thread-safe)
                                 expired_users.append((user_id, conv_data, recent_context, time_since_last))
                                 continue
-                        
+
                         # 5-minute max window BUT ONLY if also idle for 30+ seconds (prevents cutting active conversations)
                         if time_since_first >= 300 and time_since_last >= 30:
                             print(f"⏰ Max window reached for {user_id} (5 min + 30s idle)")
@@ -1688,7 +1688,7 @@ async def process_expired_conversations():
                     try:
                         # Enhanced rule-based check (NO AI) - idle_time was captured in lock
                         conv_ended = await asyncio.to_thread(check_conversation_end, context, idle_time, use_ai_fallback=False)
-                        
+
                         if conv_ended:
                             print(f"🎯 Validation: Conversation ended for {user_id} (45s idle) - Processing...")
                             with conversation_lock:
@@ -1743,39 +1743,39 @@ class RoleSelectView(discord.ui.View):
     )
     async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
         await interaction.response.defer(ephemeral=True)
-        
+
         selected_role_ids = set(select.values)
         current_role_ids = {str(role.id) for role in interaction.user.roles}
-        
+
         roles_to_add = []
         roles_to_remove = []
-        
+
         for role_name, role_id in ROLE_IDS.items():
             role = interaction.guild.get_role(int(role_id))
             if not role:
                 continue
-                
+
             if role_id in selected_role_ids:
                 if role_id not in current_role_ids:
                     roles_to_add.append(role)
             else:
                 if role_id in current_role_ids:
                     roles_to_remove.append(role)
-        
+
         if roles_to_add:
             await interaction.user.add_roles(*roles_to_add, reason="Role selection via /setup")
         if roles_to_remove:
             await interaction.user.remove_roles(*roles_to_remove, reason="Role deselection via /setup")
-        
+
         added_names = [role.name for role in roles_to_add]
         removed_names = [role.name for role in roles_to_remove]
-        
+
         message_parts = []
         if added_names:
             message_parts.append(f"✅ Added: {', '.join(added_names)}")
         if removed_names:
             message_parts.append(f"❌ Removed: {', '.join(removed_names)}")
-        
+
         if message_parts:
             await interaction.followup.send('\n'.join(message_parts), ephemeral=True)
         else:
@@ -1800,10 +1800,10 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
-    
+
     bot.add_view(RoleSelectView())
     print("✅ Persistent role selection view registered")
-    
+
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} command(s)')
@@ -1886,7 +1886,7 @@ async def on_message(message):
                     print(f"Muted {message.author.name} for spamming in trading channel (repeated within {time_diff:.1f}s)")
                 except Exception as e:
                     print(f"Error muting user: {e}")
-                
+
                 await bot.process_commands(message)
                 return
 
@@ -2018,16 +2018,16 @@ async def say(interaction: discord.Interaction, message: str, message_id: Option
     if str(interaction.user.id) not in OWNER_IDS:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-    
+
     await interaction.response.defer(ephemeral=True)
-    
+
     if message_id:
         try:
             target_message = await interaction.channel.fetch_message(int(message_id))
             if target_message.author.id != bot.user.id:
                 await interaction.followup.send("❌ I can only edit my own messages!", ephemeral=True)
                 return
-            
+
             await target_message.edit(content=message)
             await interaction.followup.send(f"✅ Message edited successfully!", ephemeral=True)
         except discord.NotFound:
@@ -2053,7 +2053,7 @@ async def talk(interaction: discord.Interaction, context: str, talk_id: str):
         return
 
     await interaction.response.defer(ephemeral=True)
-    
+
     try:
         target_message = await interaction.channel.fetch_message(int(talk_id))
         await target_message.reply(context)
@@ -2288,18 +2288,18 @@ async def kbexport(interaction: discord.Interaction):
     try:
         # Export data before deferring to avoid timeout
         json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
-        
+
         if entry_count == 0:
             await interaction.response.send_message("📦 Knowledge base is empty!", ephemeral=True)
             return
-        
+
         # Now defer since we have the data
         await interaction.response.defer(ephemeral=True)
-        
+
         if len(json_data) > 1900:
             file_buffer = io.BytesIO(json_data.encode('utf-8'))
             file = discord.File(file_buffer, filename=f"knowledge_base_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
-            
+
             await interaction.followup.send(
                 f"📦 **Knowledge Base Export**\n\n"
                 f"**Total Entries:** {entry_count}\n"
@@ -2329,18 +2329,18 @@ async def extractkb(interaction: discord.Interaction):
     try:
         # Export data before deferring to avoid timeout
         json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
-        
+
         if entry_count == 0:
             await interaction.response.send_message("📦 Knowledge base is empty!", ephemeral=True)
             return
-        
+
         # Now defer since we have the data
         await interaction.response.defer(ephemeral=True)
-        
+
         if len(json_data) > 1900:
             file_buffer = io.BytesIO(json_data.encode('utf-8'))
             file = discord.File(file_buffer, filename=f"knowledge_base_extract_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
-            
+
             await interaction.followup.send(
                 f"📦 **Knowledge Base Extract**\n\n"
                 f"**Total Entries:** {entry_count}\n"
@@ -2369,16 +2369,16 @@ async def downloadkb(interaction: discord.Interaction):
 
     try:
         json_data, entry_count = await asyncio.to_thread(db.export_knowledge_as_file)
-        
+
         if entry_count == 0:
             await interaction.response.send_message("📦 Knowledge base is empty - no Q&A stored yet!", ephemeral=True)
             return
-        
+
         await interaction.response.defer(ephemeral=True)
-        
+
         file_buffer = io.BytesIO(json_data.encode('utf-8'))
         file = discord.File(file_buffer, filename=f"bloom_kb_download_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json")
-        
+
         await interaction.followup.send(
             f"📥 **Knowledge Base Download**\n\n"
             f"**Total Q&A Pairs:** {entry_count}\n"
@@ -2470,22 +2470,22 @@ async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, seman
 
     try:
         duplicates = await asyncio.to_thread(db.find_all_duplicates, semantic_threshold, fuzzy_threshold)
-        
+
         if not duplicates:
             await interaction.followup.send("✅ No duplicates found in the knowledge base!", ephemeral=True)
             return
-        
+
         if dry_run:
             embed = discord.Embed(
                 title="🔍 Duplicate Detection Report (Dry Run)",
                 description=f"Found **{len(duplicates)}** duplicate pairs",
                 color=discord.Color.orange()
             )
-            
+
             for i, dup in enumerate(duplicates[:5]):
                 older_id = dup['id1'] if dup.get('created1', '') < dup.get('created2', '') else dup['id2']
                 newer_id = dup['id2'] if older_id == dup['id1'] else dup['id1']
-                
+
                 embed.add_field(
                     name=f"Pair {i+1}: IDs {dup['id1']} & {dup['id2']} ({dup['match_type']})",
                     value=(
@@ -2496,21 +2496,21 @@ async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, seman
                     ),
                     inline=False
                 )
-            
+
             if len(duplicates) > 5:
                 embed.set_footer(text=f"Showing 5 of {len(duplicates)} duplicates. Use dry_run=False to remove them.")
             else:
                 embed.set_footer(text="Set dry_run=False to remove these duplicates.")
-            
+
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
             removed_count = 0
             for dup in duplicates:
                 older_id = dup['id1'] if dup.get('created1', '') < dup.get('created2', '') else dup['id2']
-                
+
                 if db.remove_duplicate_entry(older_id):
                     removed_count += 1
-            
+
             await interaction.followup.send(
                 f"✅ **Deduplication Complete!**\n\n"
                 f"**Duplicates Found:** {len(duplicates)}\n"
@@ -2520,7 +2520,7 @@ async def dedupekb(interaction: discord.Interaction, dry_run: bool = True, seman
                 ephemeral=True
             )
             print(f"🧹 Deduplication: {removed_count} duplicates removed by {interaction.user.name}")
-    
+
     except Exception as e:
         await interaction.followup.send(f"❌ Error during deduplication: {str(e)}", ephemeral=True)
         print(f"Error in /dedupekb: {e}")
@@ -2535,17 +2535,17 @@ async def kbanalytics(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         stats = db.get_database_stats()
         duplicates = await asyncio.to_thread(db.find_all_duplicates)
-        
+
         embed = discord.Embed(
             title="📊 Knowledge Base Analytics",
             color=discord.Color.blue()
         )
-        
+
         total_entries = stats.get('knowledge_count', 0)
         duplicate_count = len(duplicates)
         clean_entries = total_entries - duplicate_count
         health_score = (clean_entries / total_entries * 100) if total_entries > 0 else 100
-        
+
         embed.add_field(
             name="📈 Database Health",
             value=(
@@ -2556,7 +2556,7 @@ async def kbanalytics(interaction: discord.Interaction):
             ),
             inline=False
         )
-        
+
         embed.add_field(
             name="⭐ Quality Metrics",
             value=(
@@ -2566,21 +2566,21 @@ async def kbanalytics(interaction: discord.Interaction):
             ),
             inline=False
         )
-        
+
         if duplicates:
             match_types = {}
             for dup in duplicates:
                 match_type = dup.get('match_type', 'unknown')
                 match_types[match_type] = match_types.get(match_type, 0) + 1
-            
+
             match_summary = '\n'.join([f"**{k}:** {v}" for k, v in match_types.items()])
-            
+
             embed.add_field(
                 name="🔍 Duplicate Analysis",
                 value=match_summary,
                 inline=False
             )
-        
+
         embed.add_field(
             name="💡 Recommendations",
             value=(
@@ -2589,11 +2589,11 @@ async def kbanalytics(interaction: discord.Interaction):
             ),
             inline=False
         )
-        
+
         embed.set_footer(text=f"Report generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        
+
         await interaction.followup.send(embed=embed, ephemeral=True)
-    
+
     except Exception as e:
         await interaction.followup.send(f"❌ Error generating analytics: {str(e)}", ephemeral=True)
         print(f"Error in /kbanalytics: {e}")
@@ -2619,7 +2619,7 @@ async def deletekb(interaction: discord.Interaction):
             with conn.cursor() as cur:
                 cur.execute('DELETE FROM knowledge')
                 conn.commit()
-            
+
             await interaction.followup.send(
                 f"🗑️ **Knowledge base cleared!**\n\n"
                 f"Deleted {entry_count} entries from the knowledge base.\n"
@@ -2644,10 +2644,10 @@ async def store(interaction: discord.Interaction, json_data: str):
     # Check if already acknowledged
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
-    
+
     try:
         entries = json.loads(json_data)
-        
+
         if not isinstance(entries, list):
             await interaction.followup.send("❌ JSON data must be an array of entries.", ephemeral=True)
             return
@@ -2660,7 +2660,7 @@ async def store(interaction: discord.Interaction, json_data: str):
             try:
                 question = entry.get('question', '').strip()
                 answer = entry.get('answer', '').strip()
-                
+
                 if not question or not answer:
                     skipped_count += 1
                     continue
@@ -2774,9 +2774,9 @@ async def setup(interaction: discord.Interaction):
 
     view = RoleSelectView()
     message = await interaction.channel.send(embed=embed, view=view)
-    
+
     db.save_setup_message(str(interaction.channel_id), str(message.id))
-    
+
     await interaction.followup.send("✅ Role selection message has been set up!", ephemeral=True)
     print(f"🎯 Setup message created in channel {interaction.channel_id} by {interaction.user.name}")
 
@@ -2799,32 +2799,32 @@ async def poll(interaction: discord.Interaction, question: str, option1: str, op
                option5: Optional[str] = None, option6: Optional[str] = None,
                option7: Optional[str] = None, option8: Optional[str] = None,
                option9: Optional[str] = None, option10: Optional[str] = None):
-    
+
     options = [option1, option2, option3, option4, option5, option6, option7, option8, option9, option10]
     options = [opt for opt in options if opt is not None]
-    
+
     if len(options) < 2:
         await interaction.response.send_message("You need at least 2 options for a poll!", ephemeral=True)
         return
-    
+
     if len(options) > 10:
         await interaction.response.send_message("Maximum 10 options allowed!", ephemeral=True)
         return
-    
+
     emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
-    
+
     description = '\n'.join([f"{emojis[i]} {opt}" for i, opt in enumerate(options)])
-    
+
     embed = discord.Embed(
         title=f"📊 {question}",
         description=description,
         color=discord.Color.blue()
     )
     embed.set_footer(text=f"Poll created by {interaction.user.name}")
-    
+
     await interaction.response.send_message(embed=embed)
     message = await interaction.original_response()
-    
+
     for i in range(len(options)):
         await message.add_reaction(emojis[i])
 
@@ -2836,29 +2836,29 @@ async def roll(interaction: discord.Interaction, dice: str):
         if len(parts) != 2:
             await interaction.response.send_message("Invalid format! Use format like: 2d6, 1d20, 3d10", ephemeral=True)
             return
-        
+
         num_dice = int(parts[0]) if parts[0] else 1
         num_sides = int(parts[1])
-        
+
         if num_dice < 1 or num_dice > 100:
             await interaction.response.send_message("Number of dice must be between 1 and 100!", ephemeral=True)
             return
-        
+
         if num_sides < 2 or num_sides > 1000:
             await interaction.response.send_message("Number of sides must be between 2 and 1000!", ephemeral=True)
             return
-        
+
         rolls = [random.randint(1, num_sides) for _ in range(num_dice)]
         total = sum(rolls)
-        
+
         if num_dice <= 10:
             rolls_str = ', '.join(str(r) for r in rolls)
             result = f"🎲 Rolling {dice}: [{rolls_str}] = **{total}**"
         else:
             result = f"🎲 Rolling {dice}: **{total}** (showing total only)"
-        
+
         await interaction.response.send_message(result)
-    
+
     except ValueError:
         await interaction.response.send_message("Invalid dice format! Use format like: 2d6, 1d20, 3d10", ephemeral=True)
 
@@ -2871,76 +2871,76 @@ async def coinflip(interaction: discord.Interaction):
 @bot.tree.command(name="serverinfo", description="Display server information")
 async def serverinfo(interaction: discord.Interaction):
     guild = interaction.guild
-    
+
     embed = discord.Embed(
         title=f"ℹ️ {guild.name}",
         color=discord.Color.blue()
     )
-    
+
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    
+
     embed.add_field(name="Owner", value=guild.owner.mention if guild.owner else "Unknown", inline=True)
     embed.add_field(name="Server ID", value=str(guild.id), inline=True)
     embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
-    
+
     embed.add_field(name="Members", value=str(guild.member_count), inline=True)
     embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
     embed.add_field(name="Channels", value=str(len(guild.channels)), inline=True)
-    
+
     text_channels = len([c for c in guild.channels if isinstance(c, discord.TextChannel)])
     voice_channels = len([c for c in guild.channels if isinstance(c, discord.VoiceChannel)])
-    
+
     embed.add_field(name="Text Channels", value=str(text_channels), inline=True)
     embed.add_field(name="Voice Channels", value=str(voice_channels), inline=True)
     embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier}", inline=True)
-    
+
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="userinfo", description="Display user information")
 @app_commands.describe(user="The user to get info about (leave empty for yourself)")
 async def userinfo(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     target = user or interaction.user
-    
+
     embed = discord.Embed(
         title=f"👤 {target.name}",
         color=target.color if target.color != discord.Color.default() else discord.Color.blue()
     )
-    
+
     if target.avatar:
         embed.set_thumbnail(url=target.avatar.url)
-    
+
     embed.add_field(name="ID", value=str(target.id), inline=True)
     embed.add_field(name="Nickname", value=target.nick if target.nick else "None", inline=True)
     embed.add_field(name="Bot", value="Yes" if target.bot else "No", inline=True)
-    
+
     embed.add_field(name="Account Created", value=target.created_at.strftime("%Y-%m-%d %H:%M UTC"), inline=False)
     embed.add_field(name="Joined Server", value=target.joined_at.strftime("%Y-%m-%d %H:%M UTC") if target.joined_at else "Unknown", inline=False)
-    
+
     roles = [role.mention for role in target.roles if role.name != "@everyone"]
     if roles:
         embed.add_field(name=f"Roles [{len(roles)}]", value=" ".join(roles[:10]) + ("..." if len(roles) > 10 else ""), inline=False)
     else:
         embed.add_field(name="Roles", value="No roles", inline=False)
-    
+
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="avatar", description="Display user's avatar")
 @app_commands.describe(user="The user whose avatar to display (leave empty for yourself)")
 async def avatar(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     target = user or interaction.user
-    
+
     embed = discord.Embed(
         title=f"🖼️ {target.name}'s Avatar",
         color=discord.Color.blue()
     )
-    
+
     if target.avatar:
         embed.set_image(url=target.avatar.url)
         embed.description = f"[Download]({target.avatar.url})"
     else:
         embed.description = "This user has no custom avatar."
-    
+
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="help", description="Show all available commands")
@@ -2978,7 +2978,7 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="📊 Server & User Info",
         value=(
@@ -3013,7 +3013,7 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="🥀Kb Features",
         value=(
